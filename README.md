@@ -27,21 +27,21 @@ The Xbox 360 release of **Sleeping Dogs**, lifted instruction by instruction to 
 > **No game data is included.** You need your own copy of the Xbox 360 disc. The recompiled code, the shader
 > library and the NRO are made on your computer from it.
 
-## ✨ Features
+##  Features
 
-- 🧠 **Native code**: the retail executable (`default.xex`) recompiled to AArch64 with ReXGlue on a Switch fork of
+-  **Native code**: the retail executable (`default.xex`) recompiled to AArch64 with ReXGlue on a Switch fork of
   its SDK (devkitA64, libnx, Mesa NVK as the Vulkan driver).
-- 🎨 **Native renderer** (`renderer/`): the game's Xenos command stream drawn directly with Vulkan, shaders
+-  **Native renderer** (`renderer/`): the game's Xenos command stream drawn directly with Vulkan, shaders
   translated ahead of time, instead of emulating the Xenos GPU. Developed and tested on a Windows bench that runs the
   same renderer, then built into the NRO unchanged.
-- 🎬 **Videos** (Square Enix / UFG logos, cutscenes), **audio** through the SDK's XMA decoder.
-- 🎮 **Switch branding patch** (`port/tools/apply_branding.py`): "Xbox 360" texts and button glyphs replaced by
+-  **Videos** (Square Enix / UFG logos, cutscenes), **audio** through the SDK's XMA decoder.
+-  **Switch branding patch** (`port/tools/apply_branding.py`): "Xbox 360" texts and button glyphs replaced by
   Nintendo Switch ones in your data files.
-- ⏱️ **Frame limit** 30 / 60 / unlimited (`sdretail.toml`), measured fps in the log.
-- 🔬 **Tooling**: data formats (`.big`/`.bix` archives, text tables, textures), offline shader library builder,
+-  **Frame limit** 30 / 60 / unlimited (`sdretail.toml`), measured fps in the log.
+-  **Tooling**: data formats (`.big`/`.bix` archives, text tables, textures), offline shader library builder,
   bench automation (recorded input replay to gameplay, frame dumps), Switch profile symbolizer.
 
-## 📊 Status
+##  Status
 
 | Area | State |
 | --- | --- |
@@ -59,7 +59,7 @@ manually instanced meshes (vertex pulling), the black frame (shader translator R
 
 The full history, with every measurement and decision, is in [portlog.md](portlog.md) (Russian).
 
-## ⚡ Performance
+##  Performance
 
 Handheld, stock clocks (CPU 1224 MHz, GPU 614 MHz), build 0.1.0:
 
@@ -74,7 +74,7 @@ takes ~67 % of a core (~12 µs per draw plus ~100 ms per frame of fixed work); f
 each, almost all of it spinning in Direct3D's fence wait, which on the Xbox 360 yields to the other hardware thread
 and here burns a core; audio (Wwise) takes ~29 %. On the bench (RTX 3070 Ti) the same frame takes 2.8 µs per draw.
 
-## 🎨 The native renderer
+##  The native renderer
 
 `renderer/` is a Vulkan backend for ReXGlue that replaces the emulation of the Xenos GPU for this game. It is a
 snapshot of the backend as developed in the SDK fork (`port/tools/export_renderer.ps1`), meant to be reusable by
@@ -91,7 +91,7 @@ other Xbox 360 ports on the same SDK:
   faces assembled from resolves, bindless descriptors.
 - **Recording**: only state changes are recorded, occlusion queries answered from host queries.
 
-## 🛠️ Building
+##  Building
 
 Not packaged for others yet; the steps are written down for this machine in [docs/repro.md](docs/repro.md) and
 [docs/switch-bringup.md](docs/switch-bringup.md) (Russian). In short:
@@ -104,7 +104,7 @@ Not packaged for others yet; the steps are written down for this machine in [doc
 
 `nx/desktop` builds the same game for Windows with the same renderer: the bench where rendering is debugged.
 
-## 🗺️ Roadmap
+##  Roadmap
 
 1. **Console crash** in the game's worker threads (allocator pool `0x82F73A74`).
 2. **CPU**: let the fence-wait spin yield the core; frame lag on the fence wait (wait for the previous frame);
@@ -113,7 +113,7 @@ Not packaged for others yet; the steps are written down for this machine in [doc
 3. **GPU**: 540p option, render scale; check shadow filtering on NVK.
 4. A deko3d backend for the renderer (lower driver overhead on the Switch) once the CPU side is under control.
 
-## ⚖️ Legal
+##  Legal
 
 Unofficial fan project with no affiliation to Square Enix, United Front Games or Nintendo. "Sleeping Dogs" and its
 logo are trademarks of their respective owners. You provide your own legally obtained copy of the game; nothing
