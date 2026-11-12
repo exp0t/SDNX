@@ -1,0 +1,46 @@
+# Code generation options for speed (Switch). Root keys: they must stay outside any table.
+#
+# Same options as masseffect-nx app/perf_overrides.toml (measured there on the console: about -13 % instructions,
+# -3 % main thread). They change only how the C++ is written; the guest-visible result is the same.
+# Checks for Sleeping Dogs after every codegen: nx/tools/sd_codegen.sh (read_before_write.py + pch patches).
+
+# Guest registers as C++ locals instead of PPCContext fields in memory.
+cr_as_local = true
+non_volatile_as_local = true
+xer_as_local = true
+ctr_as_local = true
+non_argument_as_local = true
+
+# Arguments in registers: off (no gain on top of the locals in masseffect-nx, needs a console run).
+args_in_registers = false
+
+# No mfmsr/mtmsrd fences, ctx.msr stores or global lock around the guest atomic sequences; reservation in a local.
+# Checked on the Sleeping Dogs code (2026-11-08): all 1121 REX_ENTER_GLOBAL_LOCK brackets surround exactly one
+# lwarx/stwcx. pair with no call inside, and stwcx. is emitted as a compare-and-swap, so atomicity does not depend on
+# the lock (same argument as masseffect-nx tools/pch_no_global_lock.py).
+skip_msr = true
+reserved_as_local = true
+
+# No `ctx.lr = <ret>;` before calls. sdretail has no hooks that compare ctx.lr, so no return address is kept.
+elide_lr_stores = true
+lr_keep_returns = []
+
+# D-form loads/stores as base + zext(reg) + disp; fctiwz inline; dcbt/dcbtst as host prefetch.
+dform_disp_split = true
+fctiwz_inline = true
+dcbt_prefetch = true
+
+# share_registers: split pieces / funclets that read a register before writing it. Filled from
+# tools/read_before_write.py on the generated code (see nx/tools/sd_codegen.sh output).
+#
+# Result of the check (2026-11-08):
+#   non-volatile registers: 5 functions, all harmless residue (no mark):
+#     sub_82BE5340, sub_82BE56D0  xor r30,r30,r30 (zeroing idiom)
+#     sub_82C0FEB0                guest setjmp (mfcr reads cr1-cr7 only to store them in the jmp_buf)
+#     sub_82C54558                subfe rX,r29,r29 (result depends only on CA)
+#     sub_82CF2D04                4-byte orphan fragment, no callers
+#   argument registers (--volatile): 6 functions, all marked:
+#     sub_82C0AAA4                stack probe (_alloca_probe): size in r12, 27 call sites (here)
+#     sub_8261EBB0/EC98/ED10/ED88/EE00  tail fragments entered with `b`, read r11 (marked in overrides.toml)
+[functions]
+"0x82C0AAA4" = { share_registers = true }

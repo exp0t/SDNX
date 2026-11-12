@@ -1,0 +1,42 @@
+# Sleeping Dogs (Xbox 360) -> Switch: границы, найденные автоциклом.
+# Каждый адрес - цель ветвления внутрь уже известной функции (COMDAT folding).
+# Размеры не задаются: границу определяет Discover по реальному коду PPC.
+# share_registers: хвостовые фрагменты, в которые родитель прыгает `b` с r11 в регистре
+# (read_before_write.py --volatile, 2026-11-08); без этого non_argument_as_local отдаст им r11 = 0.
+
+[functions]
+"0x821C2AA0" = { }
+"0x82248850" = { }
+"0x82252EE0" = { }
+"0x8233E2B8" = { }
+"0x82343DE0" = { }
+"0x823470E8" = { }
+"0x82355C58" = { }
+"0x8235AD88" = { }
+"0x8235AE48" = { }
+"0x82406CD8" = { }
+"0x8244EDE0" = { }  # li r4,0; b 0x824455D8 - thunk next to sub_8244EDE8, called through a pointer (crash in story, 2026-11-08)
+"0x8247BFF0" = { }
+"0x8261EBB0" = { share_registers = true }
+"0x8261EC98" = { share_registers = true }
+"0x8261ED10" = { share_registers = true }
+"0x8261ED88" = { share_registers = true }
+"0x8261EE00" = { share_registers = true }
+"0x82634DA0" = { }
+"0x829107A0" = { }  # vtable forwarding thunk (lwz r3,0(r4) .. bctr) reached only through a pointer (crash 2026-11-09)
+"0x829107C8" = { }
+"0x829107E0" = { }
+"0x829107F8" = { }  # same thunk series, found by the image scan (uncovered code after bctr)
+"0x82910810" = { }
+"0x82910828" = { }
+"0x82A4FC20" = { }
+"0x82AD3960" = { }
+"0x82B23308" = { }
+"0x82B3A830" = { }
+"0x82B5D078" = { }
+"0x82C24420" = { }
+"0x82C24440" = { }
+"0x82C29700" = { }
+"0x82C2B300" = { }
+"0x82C2DB10" = { }
+"0x82C3D5B8" = { }

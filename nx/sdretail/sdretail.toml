@@ -1,0 +1,27 @@
+# Sleeping Dogs for Nintendo Switch: settings.
+# Copy next to the NRO: sdmc:/switch/sdretail/sdretail.toml. Every key is optional.
+
+# Frame rate limit: 30 (the game's own), 60, or 0 = no limit (for overclocked consoles).
+# Also changed in the game: Settings > Display > FPS LIMITER (needs the data patched with apply_branding.py);
+# the game writes the choice back to this line.
+sdretail_fps_limit = 30
+
+# Face buttons by letter (default): Switch A (right) accepts, B (bottom) goes back, X = X, Y = Y; the data must be
+# patched with apply_branding.py --by-letter so the glyphs match. true = by position (bottom button B accepts, as on
+# an Xbox pad); then patch the data without --by-letter.
+# input_xbox_layout = false
+
+# Native renderer (Sleeping Dogs' own Vulkan path instead of the Xenos emulation): much faster. Needs the
+# shader package next to the NRO: sdmc:/switch/sdretail/sdnx_shaders/ (index.txt + *.spv).
+# sdnx_native_renderer = true
+
+# Log the measured frame rate every 5 seconds.
+# sdretail_fps_log = true
+
+# First run on a new console: detailed log in logs/sdretail_*.log.
+# log_level = "debug"
+
+[log.levels]
+# The kernel stubs KeSaveFloatingPointState / KeRestoreFloatingPointState warn on every call, about two lines per
+# frame (measured on the desktop build): a constant write to the SD card. Only errors from that category.
+krnl = "error"

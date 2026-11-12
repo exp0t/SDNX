@@ -1,0 +1,15 @@
+﻿# ReXGlue manifest: Sleeping Dogs (Xbox 360 retail) -> Nintendo Switch.
+# Кодогенерация: rexglue codegen sdretail_manifest.toml
+
+[project]
+name = "sdretail"
+sdk_version = "0.10.0"
+game_root = "D:/CODE/SDNX/port/assets"
+
+[entrypoint]
+file_path = "D:/CODE/SDNX/port/assets/default.xex"
+out_directory_path = "generated/default"
+
+# overrides.toml       COMDAT-folded entry points found by the autoloop (port/tools/autoloop.py)
+# perf_overrides.toml  code generation options for speed (registers as C++ locals, no msr/global lock, ...)
+includes = ["overrides.toml", "perf_overrides.toml"]
