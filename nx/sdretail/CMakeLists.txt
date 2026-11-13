@@ -54,6 +54,13 @@ if(REXGLUE_PLATFORM_SWITCH)
     target_link_options(sdretail PRIVATE -Wl,--wrap=memset)
 endif()
 
+# A/B (nx/tools/sd_build_nro_volatile.sh): guest loads/stores volatile again, as on the desktop bench (the default Switch
+# build strips them with pch_no_volatile.py; the generated pch keeps REX_GUEST_VOLATILE as the switch).
+option(SDRETAIL_GUEST_VOLATILE "Guest memory accesses of the generated code as volatile" OFF)
+if(SDRETAIL_GUEST_VOLATILE AND TARGET sdretail_recomp)
+    target_compile_definitions(sdretail_recomp PRIVATE REX_GUEST_VOLATILE=volatile)
+endif()
+
 # sdretail_register.cpp is a 4 MB table of 82k function registrations: -O3 on it costs tens of
 # minutes of compile time and changes nothing at runtime (no hot code path).
 set_source_files_properties(

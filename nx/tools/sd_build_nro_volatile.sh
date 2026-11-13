@@ -19,7 +19,7 @@ docker_cmd run --rm -v "$ME:$ME" -v "$MESA:$MESA:ro" -w "$ME" \
     cmake -S sdretail -B "$NRO_OUT" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$ME/tools/switch/cmake/switch-devkitA64.cmake" \
       -DDEVKITPRO=/opt/devkitpro \
-      -DCMAKE_CXX_FLAGS="-DREX_GUEST_VOLATILE=volatile" \
+      -DSDRETAIL_GUEST_VOLATILE=ON \
       -DREXGLUE_SWITCH_NVK_SDK="$MESA/opt/devkitpro/portlibs/switch" > "$NRO_OUT.configure.log" 2>&1 \
       || { tail -40 "$NRO_OUT.configure.log"; exit 1; }
     cmake --build "$NRO_OUT" -j "$JOBS"
