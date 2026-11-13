@@ -2,6 +2,7 @@
 # same build (nx/elf/). addr2line runs in the devkitA64 Docker image through WSL (SUDO_PW: the WSL sudo password, or be in the docker group).
 #   python prof_symbolize.py <rex_profile.log> <nx/elf/sdretail_XXXX.elf> [blocks=4] [top=14] [min_cpu=5]
 import collections
+import os
 import re
 import subprocess
 import sys
@@ -35,7 +36,7 @@ elf_rel = elf.replace(chr(92), '/').split('SDNX/')[-1]
 script = ('/opt/devkitpro/devkitA64/bin/aarch64-none-elf-addr2line -f -C -e /w/' + elf_rel +
           ' $(cat /w/port/pcs_prof.txt)')
 open(root + 'port/pcs_prof.sh', 'w', newline='\n').write(script + '\n')
-cmd = ('echo "$SUDO_PW" | sudo -S -p "" docker run --rm -v /mnt/d/CODE/SDNX:/w devkitpro/devkita64:latest '
+cmd = ('echo "' + os.environ.get('SUDO_PW', '') + '" | sudo -S -p "" docker run --rm -v /mnt/d/CODE/SDNX:/w devkitpro/devkita64:latest '
        'bash /w/port/pcs_prof.sh')
 r = subprocess.run(['wsl', '-e', 'bash', '-lc', cmd], capture_output=True, text=True)
 out = r.stdout.split('\n')

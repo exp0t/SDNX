@@ -57,8 +57,6 @@ Fixed lately: the dark filter with a lit strip at the right edge (Xenos clears a
 alias; now mirrored), black intro videos, white floor (CTX1 normal maps, packed normals, cube faces), spikes from
 manually instanced meshes (vertex pulling), the black frame (shader translator RCP/LOG clamps, resolve R/B swap).
 
-The full history, with every measurement and decision, is in [portlog.md](portlog.md) (Russian).
-
 ##  Performance
 
 Handheld, stock clocks (CPU 1224 MHz, GPU 614 MHz), build 0.1.0:
