@@ -109,6 +109,23 @@ VkClearColorValue DecodeColorClear(xenos::ColorRenderTargetFormat format, uint32
 
 }  // namespace
 
+void NativeCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  if (index >= 0x2000 && index < RegisterFile::kRegisterCount) {
+    register_file_->values[index] = value;
+    return;
+  }
+  CommandProcessor::WriteRegister(index, value);
+}
+
+void NativeCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) {
+  if (start_index >= 0x2000 && start_index + num_registers <= RegisterFile::kRegisterCount) {
+    uint32_t* dst = &register_file_->values[start_index];
+    for (uint32_t i = 0; i < num_registers; ++i) dst[i] = __builtin_bswap32(base[i]);
+    return;
+  }
+  CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
+}
+
 NativeCommandProcessor::NativeCommandProcessor(GraphicsSystem* graphics_system,
                                                system::KernelState* kernel_state)
     : CommandProcessor(graphics_system, kernel_state) {}

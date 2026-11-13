@@ -26,6 +26,8 @@ set(SDRETAIL_SOURCES
     src/sdnx_fps_limit.cpp
     src/sdnx_alloc_trace.cpp
     src/sdnx_verify_data.cpp
+    src/sdnx_perf_hooks.cpp
+    src/sdnx_memset.cpp
 )
 
 add_executable(sdretail ${SDRETAIL_SOURCES})
@@ -46,6 +48,11 @@ foreach(_target sdretail sdretail_recomp)
             $<$<CXX_COMPILER_ID:GNU>:-fno-strict-aliasing>)
     endif()
 endforeach()
+
+# Zero fills of 160+ bytes without newlib's DC ZVA path (src/sdnx_memset.cpp: 10.6 % of the GPU thread on the console).
+if(REXGLUE_PLATFORM_SWITCH)
+    target_link_options(sdretail PRIVATE -Wl,--wrap=memset)
+endif()
 
 # sdretail_register.cpp is a 4 MB table of 82k function registrations: -O3 on it costs tens of
 # minutes of compile time and changes nothing at runtime (no hot code path).

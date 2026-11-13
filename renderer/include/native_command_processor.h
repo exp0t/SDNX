@@ -41,6 +41,10 @@ class NativeCommandProcessor : public CommandProcessor {
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
+  // Registers from 0x2000 up (context state, ALU / fetch / bool / loop constants) have no side effects in the base
+  // WriteRegister (its special cases are all below 0x2000): stored directly, without its per-register lookup.
+  void WriteRegister(uint32_t index, uint32_t value) override;
+  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;

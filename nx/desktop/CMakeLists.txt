@@ -23,6 +23,7 @@ set(SDRETAIL_SOURCES
     ${APP_SRC}/sdnx_fps_limit.cpp
     ${APP_SRC}/sdnx_alloc_trace.cpp
     ${APP_SRC}/sdnx_verify_data.cpp
+    ${APP_SRC}/sdnx_perf_hooks.cpp
 )
 add_executable(sdretail WIN32 ${SDRETAIL_SOURCES})
 target_include_directories(sdretail PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${APP_SRC}" "${REXSDK_DIR}/thirdparty/imgui")
