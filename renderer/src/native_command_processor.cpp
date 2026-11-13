@@ -27,6 +27,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/string/buffer.h>
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/presenter.h>
@@ -892,7 +893,7 @@ void NativeCommandProcessor::ReportStats() {
     for (uint64_t ns : stats_.prof_ns) total += double(ns);
     REXGPU_INFO("[sdnx_prof] per draw (us): state {:.2f} vertices {:.2f} (pairing {:.2f} pulled {:.2f} bindings {:.2f}) indices {:.2f} constants+textures {:.2f} "
                 "pipeline {:.2f} record {:.2f} | total {:.2f} us/draw, {:.2f} ms/frame in draws | hashed geometry: "
-                "hits {:.0f} (reused {:.0f}) fills {:.0f} ({:.2f} MB) /frame, entries {}, hashed {:.1f} MB/frame of bindings {:.1f} MB; hot refusals {:.0f}/frame, page age {:.0f} frames, strikes avg {:.1f} max {}",
+                "hits {:.0f} (reused {:.0f}) fills {:.0f} ({:.2f} MB) /frame, entries {}, hashed {:.1f} MB/frame of bindings {:.1f} MB; hot refusals {:.0f}/frame, page age {:.0f} frames, strikes avg {:.1f} max {}; constants reused {:.0f}/frame, set binds skipped {:.0f}/frame",
                 stats_.prof_ns[0] * to_us / d, stats_.prof_ns[1] * to_us / d, stats_.prof_sub[0] * to_us / d,
                 stats_.prof_sub[1] * to_us / d, stats_.prof_sub[2] * to_us / d, stats_.prof_ns[2] * to_us / d,
                 stats_.prof_ns[3] * to_us / d, stats_.prof_ns[4] * to_us / d, stats_.prof_ns[5] * to_us / d,
@@ -900,7 +901,8 @@ void NativeCommandProcessor::ReportStats() {
                 stats_.hash_fills / frames, stats_.hash_fill_bytes / frames / 1048576.0, hashed_.size(),
                 stats_.hash_bytes / frames / 1048576.0, stats_.hash_whole_bytes / frames / 1048576.0, stats_.hot_checks / frames,
                 stats_.hot_checks ? double(stats_.hot_age) / stats_.hot_checks : 0.0,
-                stats_.hot_checks ? double(stats_.hot_strikes) / stats_.hot_checks : 0.0, stats_.hot_strikes_max);
+                stats_.hot_checks ? double(stats_.hot_strikes) / stats_.hot_checks : 0.0, stats_.hot_strikes_max,
+                stats_.constants_reused / frames, stats_.constants_bind_skipped / frames);
   }
   stats_ = {};
   stats_start_ = now;
@@ -1030,10 +1032,20 @@ void NativeCommandProcessor::FinishFrontDump() {
   --dump_remaining_;
 }
 
+#if REX_PLATFORM_SWITCH
+// Guest presents for the Switch profiler (switch_perf.cpp): the "game N fps" of rex_profile.log and the FPS /
+// heartbeat of the console overlays (Status Monitor, Ultrahand) through SaltyNX. The Vulkan backend counts them in
+// its IssueSwap; without this the overlays showed nothing for the native renderer.
+extern "C" void RexSwitchPerfCount(unsigned id);
+#endif
+
 void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   (void)frontbuffer_ptr;
   ++stats_.swaps;
+#if REX_PLATFORM_SWITCH
+  RexSwitchPerfCount(0);
+#endif
   {
     static const uint64_t log_frame = std::getenv("SDNX_LOG_FRAME") ? std::strtoull(std::getenv("SDNX_LOG_FRAME"), nullptr, 10) : 0;
     if (log_frame_) REXGPU_INFO("[sdnx_frame] ---- end of swap {} ----", swap_count_);

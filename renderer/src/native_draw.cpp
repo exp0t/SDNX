@@ -1350,16 +1350,40 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     }
     return 0;
   };
-  auto upload_constants = [&](const uint32_t* values, uint32_t range, uint32_t used_bytes) -> VkDeviceSize {
+  // The upload buffer is write-combined memory: on the console every byte written there per draw was expensive (the
+  // store after the copies - the pipeline key's zero fill - held 11 % of the GPU thread, 2026-11-13). A block equal to
+  // the one uploaded last in this frame reuses that copy: compared in ordinary memory, nothing written.
+  struct UploadedCopy {
+    uint64_t frame = UINT64_MAX;
+    VkDeviceSize offset = 0;
+    uint32_t range = 0, bytes = 0;
+    alignas(16) uint8_t data[4096];
+  };
+  static UploadedCopy vs_copy, ps_copy, shared_copy;
+  auto upload_reused = [&](UploadedCopy& copy, const void* values, uint32_t range, uint32_t used_bytes) -> VkDeviceSize {
+    used_bytes = std::min(used_bytes, range);
+    if (copy.frame == frame_ && copy.range == range && copy.bytes == used_bytes &&
+        std::memcmp(copy.data, values, used_bytes) == 0) {
+      ++stats_.constants_reused;
+      return copy.offset;
+    }
     uint8_t* dst = nullptr;
     VkDeviceSize at = Upload(nullptr, range, ubo_align, &dst);
-    if (at != UINT64_MAX && used_bytes) std::memcpy(dst, values, std::min(used_bytes, range));
+    if (at == UINT64_MAX) return at;
+    if (used_bytes) {
+      std::memcpy(dst, values, used_bytes);
+      std::memcpy(copy.data, values, used_bytes);
+    }
+    copy.frame = frame_;
+    copy.offset = at;
+    copy.range = range;
+    copy.bytes = used_bytes;
     return at;
   };
-  VkDeviceSize vs_constants =
-      upload_constants(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], 4096, used_constant_bytes(vs, 256));
-  VkDeviceSize ps_constants = upload_constants(&regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X], 224 * 16,
-                                               ps_entry ? used_constant_bytes(ps, 224) : 0);
+  VkDeviceSize vs_constants = upload_reused(vs_copy, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], 4096,
+                                            used_constant_bytes(vs, 256));
+  VkDeviceSize ps_constants = upload_reused(ps_copy, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X], 224 * 16,
+                                            ps_entry ? used_constant_bytes(ps, 224) : 0);
   uint32_t shared[kSharedBlockSize / 4] = {};
   shared[256 / 4] = regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
   float alpha_ref = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
@@ -1380,7 +1404,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   for (uint32_t k = 0; k < 32; ++k) shared[(624 / 4) + k / 2] |= swizzle_codes[k] << ((k & 1) * 16);
   if (pull) std::memcpy(&shared[kPullInfoOffset / 4], pull_info, sizeof(pull_info));
   BindTextures(vs, ps_entry ? ps : nullptr, shared);
-  VkDeviceSize shared_constants = Upload(shared, sizeof(shared), ubo_align);
+  VkDeviceSize shared_constants = upload_reused(shared_copy, shared, sizeof(shared), sizeof(shared));
   if (vs_constants == UINT64_MAX || ps_constants == UINT64_MAX || shared_constants == UINT64_MAX) {
     ++stats_.skipped;
     return true;
@@ -1791,8 +1815,19 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   }
   uint32_t dynamic_offsets[3] = {uint32_t(vs_constants), uint32_t(ps_constants), uint32_t(shared_constants)};
   VkDescriptorSet constants_set = constants_sets_[uint32_t(frame_ % kFramesInFlight)];
-  dfn.vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, draw_pipeline_layout_, 4, 1, &constants_set, 3,
-                              dynamic_offsets);
+  // Same offsets as the previous draw of this command buffer (reused constants): the set stays bound.
+  static VkCommandBuffer constants_cb = VK_NULL_HANDLE;
+  static uint64_t constants_frame = UINT64_MAX;
+  static uint32_t constants_offsets[3] = {};
+  if (constants_cb != cb_ || constants_frame != frame_ || std::memcmp(constants_offsets, dynamic_offsets, 12) != 0) {
+    dfn.vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, draw_pipeline_layout_, 4, 1, &constants_set, 3,
+                                dynamic_offsets);
+    constants_cb = cb_;
+    constants_frame = frame_;
+    std::memcpy(constants_offsets, dynamic_offsets, 12);
+  } else {
+    ++stats_.constants_bind_skipped;
+  }
   if (binding_count) {
     // Rebind from the first binding that differs.
     uint32_t first = 0;

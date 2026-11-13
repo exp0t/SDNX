@@ -405,7 +405,7 @@ class NativeCommandProcessor : public CommandProcessor {
     uint64_t tex_loads = 0, tex_bytes = 0, tex_resolved = 0, tex_unsupported = 0, tex_signed = 0;
     uint64_t upload_full = 0, geo_first = 0, geo_hot = 0, geo_flagged = 0, geo_changed = 0;
     uint64_t geo_hits = 0, geo_uploads = 0, geo_bytes = 0, geo_dynamic = 0, geo_direct_bytes = 0;
-    uint64_t hash_hits = 0, hash_fills = 0, hash_fill_bytes = 0, hash_bytes = 0, hash_whole_bytes = 0, hash_reuse = 0; uint64_t prof_sub[3] = {};
+    uint64_t hash_hits = 0, hash_fills = 0, hash_fill_bytes = 0, hash_bytes = 0, hash_whole_bytes = 0, hash_reuse = 0; uint64_t constants_reused = 0, constants_bind_skipped = 0; uint64_t prof_sub[3] = {};
     mutable uint64_t hot_checks = 0, hot_age = 0, hot_strikes = 0, hot_strikes_max = 0;  // PagesHot refusals (SDNX_PROF)  // content-hashed geometry copies
     uint64_t prof_ns[6] = {}, prof_draws = 0;  // SDNX_PROF: time of the parts of DrawNative (steady_clock ticks)
   } stats_;
