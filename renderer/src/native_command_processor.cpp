@@ -459,6 +459,7 @@ void NativeCommandProcessor::EnsureFrame() {
   ReleaseRetiredViews(slot);
   for (Image& retired : retired_images_[slot]) DestroyImage(retired);
   retired_images_[slot].clear();
+  EvictTextures();  // after the release above: what it retires is destroyed when this slot comes round again
   if (!dummies_initialized_) {
     // The placeholder textures: GENERAL layout (as their descriptors say) and white. They were left in
     // UNDEFINED, so the shaders sampled undefined data (zero on NVIDIA): textured UI came out black.
@@ -948,7 +949,7 @@ void NativeCommandProcessor::ReportStats() {
     for (uint64_t ns : stats_.prof_ns) total += double(ns);
     REXGPU_INFO("[sdnx_prof] per draw (us): state {:.2f} vertices {:.2f} (pairing {:.2f} pulled {:.2f} bindings {:.2f}) indices {:.2f} constants+textures {:.2f} "
                 "pipeline {:.2f} record {:.2f} | total {:.2f} us/draw, {:.2f} ms/frame in draws | hashed geometry: "
-                "hits {:.0f} (reused {:.0f}) fills {:.0f} ({:.2f} MB) /frame, entries {}, hashed {:.1f} MB/frame of bindings {:.1f} MB; hot refusals {:.0f}/frame, page age {:.0f} frames, strikes avg {:.1f} max {}; constants reused {:.0f}/frame, set binds skipped {:.0f}/frame, texture memo hits {:.0f}/frame, shader loads without hash {:.0f}/frame, full barriers {:.0f}/frame",
+                "hits {:.0f} (reused {:.0f}) fills {:.0f} ({:.2f} MB) /frame, entries {}, hashed {:.1f} MB/frame of bindings {:.1f} MB; hot refusals {:.0f}/frame, page age {:.0f} frames, strikes avg {:.1f} max {}; constants reused {:.0f}/frame, set binds skipped {:.0f}/frame, texture memo hits {:.0f}/frame, shader loads without hash {:.0f}/frame, full barriers {:.0f}/frame, textures evicted {}, textures {}",
                 stats_.prof_ns[0] * to_us / d, stats_.prof_ns[1] * to_us / d, stats_.prof_sub[0] * to_us / d,
                 stats_.prof_sub[1] * to_us / d, stats_.prof_sub[2] * to_us / d, stats_.prof_ns[2] * to_us / d,
                 stats_.prof_ns[3] * to_us / d, stats_.prof_ns[4] * to_us / d, stats_.prof_ns[5] * to_us / d,
@@ -958,7 +959,7 @@ void NativeCommandProcessor::ReportStats() {
                 stats_.hot_checks ? double(stats_.hot_age) / stats_.hot_checks : 0.0,
                 stats_.hot_checks ? double(stats_.hot_strikes) / stats_.hot_checks : 0.0, stats_.hot_strikes_max,
                 stats_.constants_reused / frames, stats_.constants_bind_skipped / frames, stats_.tex_memo_hits / frames,
-                stats_.shader_load_hits / frames, stats_.full_barriers / frames);
+                stats_.shader_load_hits / frames, stats_.full_barriers / frames, stats_.textures_evicted, textures_.size());
   }
   stats_ = {};
   stats_start_ = now;

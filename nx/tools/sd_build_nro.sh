@@ -10,7 +10,11 @@ set -euo pipefail
 
 ME="$HOME/masseffect-nx"
 MESA=/mnt/d/CODE/SDNX/mesa-sdk
-NRO_OUT="${NRO_OUT:-out/nx-sd}"
+# Guest memory accesses of the generated code volatile (GUEST_VOLATILE=ON, the default since 2026-11-13): without it
+# (pch_no_volatile.py) the console crashed in the allocator pool 0x82F73A74 after 0.5-4 minutes; with it, 6 minutes of
+# gameplay without that crash. One build tree per setting, so switching does not rebuild everything.
+GUEST_VOLATILE="${GUEST_VOLATILE:-ON}"
+if [[ "$GUEST_VOLATILE" == ON ]]; then NRO_OUT="${NRO_OUT:-out/nx-sd-vol}"; else NRO_OUT="${NRO_OUT:-out/nx-sd}"; fi
 JOBS="${JOBS:-4}"
 DEST=/mnt/d/CODE/SDNX/nx
 
@@ -25,11 +29,12 @@ docker_cmd() {
 
 echo "== build $NRO_OUT (-j$JOBS)"
 docker_cmd run --rm -v "$ME:$ME" -v "$MESA:$MESA:ro" -w "$ME" \
-  -e ME="$ME" -e MESA="$MESA" -e NRO_OUT="$NRO_OUT" -e JOBS="$JOBS" \
+  -e ME="$ME" -e MESA="$MESA" -e NRO_OUT="$NRO_OUT" -e JOBS="$JOBS" -e GUEST_VOLATILE="$GUEST_VOLATILE" \
   devkitpro/devkita64:latest bash -euo pipefail -c '
     cmake -S sdretail -B "$NRO_OUT" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$ME/tools/switch/cmake/switch-devkitA64.cmake" \
       -DDEVKITPRO=/opt/devkitpro \
+      -DSDRETAIL_GUEST_VOLATILE="$GUEST_VOLATILE" \
       -DREXGLUE_SWITCH_NVK_SDK="$MESA/opt/devkitpro/portlibs/switch" > "$NRO_OUT.configure.log" 2>&1 \
       || { tail -40 "$NRO_OUT.configure.log"; exit 1; }
     cmake --build "$NRO_OUT" -j "$JOBS"

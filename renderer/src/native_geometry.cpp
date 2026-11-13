@@ -71,14 +71,18 @@ void FreeTo(std::map<VkDeviceSize, VkDeviceSize>& free_blocks, VkDeviceSize offs
 bool NativeCommandProcessor::InitializeGeometry() {
   const ui::vulkan::VulkanDevice* device = vulkan_device();
   uint32_t memory_type;
-  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          device, kGeometryBufferSize,
-          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-          ui::vulkan::util::MemoryPurpose::kDeviceLocal, geometry_buffer_, geometry_memory_, &memory_type)) {
-    return false;
-  }
+  // The page-watched geometry cache is off by default (see CachedGeometry): its 192 MB buffer is only made when it
+  // is turned on. On the console that memory ran out after ~6 minutes of gameplay.
   geometry_free_.clear();
-  geometry_free_[0] = kGeometryBufferSize;
+  if (std::getenv("SDNX_GEOCACHE")) {
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            device, kGeometryBufferSize,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal, geometry_buffer_, geometry_memory_, &memory_type)) {
+      return false;
+    }
+    geometry_free_[0] = kGeometryBufferSize;
+  }
   if (ui::vulkan::util::CreateDedicatedAllocationBuffer(
           device, kHashedBufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
           ui::vulkan::util::MemoryPurpose::kUpload, hashed_buffer_, hashed_memory_, &memory_type)) {

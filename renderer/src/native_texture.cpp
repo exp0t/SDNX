@@ -825,9 +825,10 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
         for (const auto& other : resolved_) {
           if (!other.second.image || other.second.format != source->format) continue;
           if (other.first < base_address || other.first >= base_address + row_bytes * th) continue;
-          // Only parts resolved in the frame of the base or the one before (the two halves of the G-buffer are
-          // resolved in the same frame); older images at those addresses belong to something else.
-          if (other.first != base_address && resolved_frame_[other.first] + 1 < base_frame) continue;
+          // (A filter keeping only parts resolved in the frame of the base or the one before was tried against the
+          // right-edge strip, which it did not fix; it is suspected of the white half-screen flashes seen on the
+          // console when frames are slow, as the G-buffer is two resolved halves. Removed, 2026-11-13.)
+          (void)base_frame;
           uint64_t delta = other.first - base_address;
           uint32_t y = uint32_t(delta / row_bytes), x = uint32_t((delta % row_bytes) / bytes_per_pixel);
           if (x < tw && y < th) parts.push_back({other.first, x, y});
@@ -956,6 +957,30 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
     packed_signs |= sign << (2 * i);
   }
   return index | packed_signs << 24;
+}
+
+// Textures were never freed: every texture the game ever sampled kept its image, and as the world streamed the
+// process ran out of memory after ~6 minutes of gameplay on the console (malloc headroom 301 -> 20 MB, then
+// std::bad_alloc and failed image creations, 2026-11-13). Every 64 frames, textures not sampled for kTextureEvictFrames
+// (validated_frame is set at the first use in each frame) are retired; sampled again later, they are reloaded.
+void NativeCommandProcessor::EvictTextures() {
+  constexpr uint64_t kTextureEvictFrames = 600;
+  if (frame_ % 64) return;
+  size_t evicted = 0;
+  for (auto it = textures_.begin(); it != textures_.end();) {
+    Texture& texture = it->second;
+    const bool stale = texture.validated_frame == ~0ull || frame_ - texture.validated_frame > kTextureEvictFrames;
+    // A texture loaded but never revalidated has validated_frame unset: give it the same time from its load.
+    if (texture.validated_frame == ~0ull && texture.loaded) texture.validated_frame = frame_;
+    if (stale && (texture.validated_frame != frame_ || !texture.loaded)) {
+      if (texture.image.image) RetireImage(texture.image);
+      it = textures_.erase(it);
+      ++evicted;
+    } else {
+      ++it;
+    }
+  }
+  stats_.textures_evicted += evicted;
 }
 
 void NativeCommandProcessor::BindTextures(Shader* vs, Shader* ps, uint32_t* shared) {
