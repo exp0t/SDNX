@@ -685,6 +685,7 @@ bool NativeCommandProcessor::LoadTexture(Texture& texture, const xenos::xe_gpu_t
   FullBarrier();
   dfn.vkCmdCopyBufferToImage(cb_, upload_[uint32_t(frame_ % kFramesInFlight)].buffer, image.image,
                              VK_IMAGE_LAYOUT_GENERAL, uint32_t(regions.size()), regions.data());
+  transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   FullBarrier();
   if (is_3d) {
     static int logged_3d = 0;
@@ -763,6 +764,7 @@ bool NativeCommandProcessor::OverlayResolvedFaces(Texture& texture, const xenos:
     region.extent = {width, height, 1};
     vulkan_device()->functions().vkCmdCopyImage(cb_, faces[f]->image, VK_IMAGE_LAYOUT_GENERAL, texture.image.image,
                                                 VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   }
   FullBarrier();
   return true;
@@ -872,8 +874,10 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
                            1};
           vulkan_device()->functions().vkCmdCopyImage(cb_, part_it->second.image, VK_IMAGE_LAYOUT_GENERAL,
                                                       copy.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+          transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
         }
-        FullBarrier();
+        // No barrier after the copies: the draw that samples this image begins a new rendering pass, and
+        // transfer_pending_ gives that pass a full barrier (it was one more per assembly, ~41 a frame).
         copy.generation = generation;
       }
       source = &copy.image;

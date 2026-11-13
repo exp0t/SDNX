@@ -1701,6 +1701,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
         VkClearRect rect = {{{x0, y0}, {uint32_t(cx1 - x0), uint32_t(cy1 - y0)}}, 0, 1};
         dfn.vkCmdClearAttachments(cb_, 1, &clear, 1, &rect);
         dfn.vkCmdEndRendering(cb_);
+        attachments_written_.push_back(target.image);  // written as an attachment (see BeginPassBarrier)
         target.drawn = true;
         ++stats_.clears;
         if (log_frame_) {
@@ -1721,7 +1722,12 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   if (depth) depth->drawn = true;
   if (!rendering_ || rendering_key_ != rendering_key) {
     EndRendering();
-    FullBarrier();
+    {
+      VkImage pass_images[5] = {};
+      for (uint32_t i = 0; i < color_count; ++i) pass_images[i] = colors[i] ? colors[i]->image : VK_NULL_HANDLE;
+      pass_images[4] = depth ? depth->image : VK_NULL_HANDLE;
+      BeginPassBarrier(pass_images, 5);
+    }
     VkRenderingAttachmentInfo color_infos[4] = {};
     for (uint32_t i = 0; i < color_count; ++i) {
       color_infos[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;

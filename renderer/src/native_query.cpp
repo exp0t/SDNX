@@ -105,6 +105,7 @@ void NativeCommandProcessor::CopyQueryResults(uint32_t slot) {
   vulkan_device()->functions().vkCmdCopyQueryPoolResults(cb_, query_pools_[slot], 0, query_used_[slot],
                                                          query_readback_[slot], 0, sizeof(uint64_t),
                                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+  transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
 }
 
 bool NativeCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,

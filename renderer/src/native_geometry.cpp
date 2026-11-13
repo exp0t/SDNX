@@ -333,6 +333,7 @@ VkDeviceSize NativeCommandProcessor::CachedGeometry(uint64_t key, uint32_t addre
   VkBufferCopy copy = {staging, offset, host_size};
   vulkan_device()->functions().vkCmdCopyBuffer(cb_, upload_[uint32_t(frame_ % kFramesInFlight)].buffer,
                                                geometry_buffer_, 1, &copy);
+  transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   entry.offset = offset;
   entry.size = host_size;
   ++stats_.geo_uploads;

@@ -230,9 +230,11 @@ void NativeCommandProcessor::InitializeLayout(Image& image) {
   if (image.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
     VkClearDepthStencilValue ds = {1.0f, 0};
     dfn.vkCmdClearDepthStencilImage(cb_, image.image, VK_IMAGE_LAYOUT_GENERAL, &ds, 1, &range);
+    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   } else {
     VkClearColorValue color = {};
     dfn.vkCmdClearColorImage(cb_, image.image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   }
   FullBarrier();
   image.initialized = true;
@@ -249,8 +251,15 @@ void NativeCommandProcessor::RetireImage(Image& image) {
   image = Image();
 }
 
-void NativeCommandProcessor::FullBarrier() {
+void NativeCommandProcessor::FullBarrier(int line, const char* file) {
   ++stats_.full_barriers;
+  static const bool prof = std::getenv("SDNX_PROF") != nullptr;
+  if (prof) {
+    const char* base = std::strrchr(file, '/');
+    const char* base2 = std::strrchr(file, '\\');
+    base = base2 > base ? base2 : base;
+    ++barrier_sites_[std::string(base ? base + 1 : file) + ":" + std::to_string(line)];
+  }
   VkMemoryBarrier barrier = {};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
   barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
@@ -258,6 +267,53 @@ void NativeCommandProcessor::FullBarrier() {
   vulkan_device()->functions().vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr,
                                                     0, nullptr);
+  // Everything recorded before is ordered with everything after: no pending transfer, no attachment hazard left.
+  transfer_pending_ = false;
+  attachments_written_.clear();
+}
+
+// Between rendering passes with nothing but draws since the last barrier: only the attachments of the earlier passes
+// have to be written before this pass reads or writes them (depth test, blending, load). Sampled textures come from
+// transfers (resolves, uploads), which set transfer_pending_ and get the full barrier.
+void NativeCommandProcessor::AttachmentBarrier() {
+  ++stats_.attachment_barriers;
+  constexpr VkPipelineStageFlags kStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+  VkMemoryBarrier barrier = {};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  vulkan_device()->functions().vkCmdPipelineBarrier(cb_, kStages, kStages, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+  attachments_written_.clear();
+}
+
+// The barrier a new rendering pass needs: full after a transfer, attachment-only when it uses an attachment an
+// earlier pass wrote since the last barrier, none otherwise (338 full barriers per frame before, 2026-11-13).
+// SDNX_FULL_BARRIERS=1 restores a full barrier before every pass (A/B).
+void NativeCommandProcessor::BeginPassBarrier(const VkImage* images, uint32_t count) {
+  static const bool always_full = std::getenv("SDNX_FULL_BARRIERS") != nullptr;
+  bool overlap = false;
+  for (uint32_t i = 0; i < count && !overlap; ++i) {
+    if (!images[i]) continue;
+    for (VkImage written : attachments_written_) {
+      if (written == images[i]) {
+        overlap = true;
+        break;
+      }
+    }
+  }
+  if (always_full || transfer_pending_) {
+    FullBarrier();
+  } else if (overlap) {
+    AttachmentBarrier();
+  } else {
+    ++stats_.pass_barriers_skipped;
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    if (images[i]) attachments_written_.push_back(images[i]);
+  }
 }
 
 NativeCommandProcessor::Image* NativeCommandProcessor::GetRenderTarget(uint32_t base_tiles, uint32_t pitch_pixels,
@@ -451,6 +507,7 @@ void NativeCommandProcessor::EnsureFrame() {
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   dfn.vkBeginCommandBuffer(cb_, &begin);  // resets it (pool created with RESET_COMMAND_BUFFER_BIT)
   bound_ = {};  // nothing is bound in a new command buffer
+  transfer_pending_ = true;  // first pass of a command buffer: full barrier (earlier submissions)
   upload_[slot].offset = 0;
   frame_open_ = true;
   ResetQueries(slot);  // the slot's previous frame has completed: its occlusion counts are readable
@@ -479,6 +536,7 @@ void NativeCommandProcessor::EnsureFrame() {
                                0, nullptr, 1, &barrier);
       VkClearColorValue white = {{1.0f, 1.0f, 1.0f, 1.0f}};
       dfn.vkCmdClearColorImage(cb_, dummy->image, VK_IMAGE_LAYOUT_GENERAL, &white, 1, &barrier.subresourceRange);
+      transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
       dummy->initialized = true;
     }
     FullBarrier();
@@ -644,8 +702,13 @@ bool NativeCommandProcessor::IssueCopy() {
       // The rectangle lands at the destination offset (not at its render target position).
       uint32_t dx = info.copy_dest_coordinate_info.offset_x_div_8 * 8;
       uint32_t dy = info.copy_dest_coordinate_info.offset_y_div_8 * 8;
-      Image* dest =
-          GetResolved(dest_base, source->format, std::max(dest_w, dx + width), std::max(dest_h, dy + height));
+      // The image is as large as what is copied into it, not the pitch-aligned destination (608 for a 600 wide
+      // resolve): a texture of the resolved size then samples it directly; with the padded size every such texture
+      // was assembled into a copy every frame (~41 copies, each a rendering pass break and two full barriers).
+      static const bool padded = std::getenv("SDNX_PADDED_RESOLVES") != nullptr;  // A/B
+      Image* dest = padded ? GetResolved(dest_base, source->format, std::max(dest_w, dx + width),
+                                         std::max(dest_h, dy + height))
+                           : GetResolved(dest_base, source->format, dx + width, dy + height);
       resolved_extent_[dest_base] = info.copy_dest_extent_start + info.copy_dest_extent_length - dest_base;
       if (log_frame_) {
         REXGPU_INFO("[sdnx_frame] resolve rt base={} fmt={} {}x{} at {},{} -> {:#x} at {},{} fmt={} swap={} clear "
@@ -707,6 +770,7 @@ bool NativeCommandProcessor::IssueCopy() {
           if (copy_w && copy_h) {
             dfn.vkCmdBlitImage(cb_, source->image, VK_IMAGE_LAYOUT_GENERAL, dest->image, VK_IMAGE_LAYOUT_GENERAL,
                                1, &blit, (sx || sy) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+            transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
           }
         }
         DumpResolveIfRequested(dest_base, *dest);
@@ -733,6 +797,7 @@ bool NativeCommandProcessor::IssueCopy() {
         bool is_depth = (it.first >> 38) & 1;
         if (is_depth || (it.first & 0xFFFFFFF) != base_pitch || !it.second.image) continue;
         dfn.vkCmdClearColorImage(cb_, it.second.image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+        transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
         ++stats_.clears;
       }
     }
@@ -746,6 +811,7 @@ bool NativeCommandProcessor::IssueCopy() {
                                      info.rb_depth_clear & 0xFF};
       VkImageSubresourceRange range = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
       dfn.vkCmdClearDepthStencilImage(cb_, target->image, VK_IMAGE_LAYOUT_GENERAL, &ds, 1, &range);
+      transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
       ++stats_.clears;
     }
   }
@@ -792,11 +858,13 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
   region.imageOffset = {int32_t(src_x), int32_t(src_y), 0};
   region.imageExtent = {src_w, src_h, 1};
   dfn.vkCmdCopyImageToBuffer(cb_, source.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &region);
+  transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   FullBarrier();
   region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   if (!sx && !sy) {
     region.imageOffset = {int32_t(dx), int32_t(dy), 0};
     dfn.vkCmdCopyBufferToImage(cb_, buffer, dest->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     // Stencil, for TryRestoreDepth.
     Image& stencil = resolved_stencil_[dest_base];
     if (stencil.image && (stencil.width < dest->width || stencil.height < dest->height)) RetireImage(stencil);
@@ -812,10 +880,12 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
       s_region.imageOffset = {int32_t(src_x), int32_t(src_y), 0};
       s_region.imageExtent = {src_w, src_h, 1};
       dfn.vkCmdCopyImageToBuffer(cb_, source.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &s_region);
+      transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
       FullBarrier();
       s_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
       s_region.imageOffset = {int32_t(dx), int32_t(dy), 0};
       dfn.vkCmdCopyBufferToImage(cb_, buffer, stencil.image, VK_IMAGE_LAYOUT_GENERAL, 1, &s_region);
+      transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     }
   } else {
     if (!depth_resolve_temp_.image || depth_resolve_temp_.width < src_w || depth_resolve_temp_.height < src_h) {
@@ -826,6 +896,7 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
     }
     region.imageOffset = {0, 0, 0};
     dfn.vkCmdCopyBufferToImage(cb_, buffer, depth_resolve_temp_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     FullBarrier();
     VkImageBlit blit = {};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -835,6 +906,7 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
     blit.dstOffsets[1] = {int32_t(dx + out_w), int32_t(dy + out_h), 1};
     dfn.vkCmdBlitImage(cb_, depth_resolve_temp_.image, VK_IMAGE_LAYOUT_GENERAL, dest->image, VK_IMAGE_LAYOUT_GENERAL,
                        1, &blit, VK_FILTER_NEAREST);
+    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   }
   FullBarrier();
 }
@@ -888,10 +960,12 @@ bool NativeCommandProcessor::TryRestoreDepth(Shader* ps) {
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {w, h, 1};
     dfn.vkCmdCopyImageToBuffer(cb_, part.second.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &region);
+    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     FullBarrier();
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     region.imageOffset = {int32_t(x), int32_t(y), 0};
     dfn.vkCmdCopyBufferToImage(cb_, buffer, target->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     auto stencil = resolved_stencil_.find(part.first);
     if (stencil == resolved_stencil_.end() || !stencil->second.image) continue;
     w = std::min(w, stencil->second.width);
@@ -903,10 +977,12 @@ bool NativeCommandProcessor::TryRestoreDepth(Shader* ps) {
     region.imageOffset = {0, 0, 0};
     region.imageExtent = {w, h, 1};
     dfn.vkCmdCopyImageToBuffer(cb_, stencil->second.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &region);
+    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     FullBarrier();
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
     region.imageOffset = {int32_t(x), int32_t(y), 0};
     dfn.vkCmdCopyBufferToImage(cb_, buffer, target->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   }
   FullBarrier();
   if (log_frame_) {
@@ -949,7 +1025,7 @@ void NativeCommandProcessor::ReportStats() {
     for (uint64_t ns : stats_.prof_ns) total += double(ns);
     REXGPU_INFO("[sdnx_prof] per draw (us): state {:.2f} vertices {:.2f} (pairing {:.2f} pulled {:.2f} bindings {:.2f}) indices {:.2f} constants+textures {:.2f} "
                 "pipeline {:.2f} record {:.2f} | total {:.2f} us/draw, {:.2f} ms/frame in draws | hashed geometry: "
-                "hits {:.0f} (reused {:.0f}) fills {:.0f} ({:.2f} MB) /frame, entries {}, hashed {:.1f} MB/frame of bindings {:.1f} MB; hot refusals {:.0f}/frame, page age {:.0f} frames, strikes avg {:.1f} max {}; constants reused {:.0f}/frame, set binds skipped {:.0f}/frame, texture memo hits {:.0f}/frame, shader loads without hash {:.0f}/frame, full barriers {:.0f}/frame, textures evicted {}, textures {}",
+                "hits {:.0f} (reused {:.0f}) fills {:.0f} ({:.2f} MB) /frame, entries {}, hashed {:.1f} MB/frame of bindings {:.1f} MB; hot refusals {:.0f}/frame, page age {:.0f} frames, strikes avg {:.1f} max {}; constants reused {:.0f}/frame, set binds skipped {:.0f}/frame, texture memo hits {:.0f}/frame, shader loads without hash {:.0f}/frame, full barriers {:.0f}/frame (attachment {:.0f}, none {:.0f}), textures evicted {}, textures {}",
                 stats_.prof_ns[0] * to_us / d, stats_.prof_ns[1] * to_us / d, stats_.prof_sub[0] * to_us / d,
                 stats_.prof_sub[1] * to_us / d, stats_.prof_sub[2] * to_us / d, stats_.prof_ns[2] * to_us / d,
                 stats_.prof_ns[3] * to_us / d, stats_.prof_ns[4] * to_us / d, stats_.prof_ns[5] * to_us / d,
@@ -959,7 +1035,19 @@ void NativeCommandProcessor::ReportStats() {
                 stats_.hot_checks ? double(stats_.hot_age) / stats_.hot_checks : 0.0,
                 stats_.hot_checks ? double(stats_.hot_strikes) / stats_.hot_checks : 0.0, stats_.hot_strikes_max,
                 stats_.constants_reused / frames, stats_.constants_bind_skipped / frames, stats_.tex_memo_hits / frames,
-                stats_.shader_load_hits / frames, stats_.full_barriers / frames, stats_.textures_evicted, textures_.size());
+                stats_.shader_load_hits / frames, stats_.full_barriers / frames, stats_.attachment_barriers / frames,
+                stats_.pass_barriers_skipped / frames, stats_.textures_evicted, textures_.size());
+  }
+  if (!barrier_sites_.empty()) {
+    std::vector<std::pair<uint64_t, std::string>> sites;
+    for (const auto& it : barrier_sites_) sites.push_back({it.second, it.first});
+    std::sort(sites.rbegin(), sites.rend());
+    std::string text;
+    for (size_t i = 0; i < sites.size() && i < 10; ++i) {
+      text += fmt::format(" {} {:.0f}", sites[i].second, double(sites[i].first) / frames);
+    }
+    REXGPU_INFO("[sdnx_prof] full barriers per frame by site:{}", text);
+    barrier_sites_.clear();
   }
   stats_ = {};
   stats_start_ = now;
@@ -1001,6 +1089,7 @@ void NativeCommandProcessor::BeginFrontDump(const Image& front) {
   region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   region.imageExtent = {front.width, front.height, 1};
   dfn.vkCmdCopyImageToBuffer(cb_, front.image, VK_IMAGE_LAYOUT_GENERAL, dump_buffer_, 1, &region);
+  transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   dump_pending_ = true;
 }
 
@@ -1229,6 +1318,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           } pc = {{float(width) / float(front->width), float(height) / float(front->height)}, {width, height}};
           dfn.vkCmdPushConstants(cb_, present_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
           dfn.vkCmdDispatch(cb_, (width + 7) / 8, (height + 7) / 8, 1);
+          transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
           barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
           barrier.dstAccessMask = ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask;
           barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
