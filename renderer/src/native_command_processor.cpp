@@ -507,15 +507,68 @@ bool NativeCommandProcessor::SubmitFrame() {
 
 Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                            const uint32_t* host_address, uint32_t dword_count) {
-  (void)guest_address;
   ++stats_.shader_loads;
+  // The game loads the microcode before nearly every draw (IM_LOAD, ~2000 times a frame on the console), and every
+  // load hashed the whole microcode. A load from guest memory (not one inline in the ring) at an address whose pages
+  // have not been written since the last load there returns the same shader without hashing: the pages are watched
+  // like a texture's (armed, version taken, then hashed). Pages written again soon after every arm are left alone.
+  struct ShaderLoad {
+    Shader* shader = nullptr;
+    uint64_t version = 0, armed_frame = 0;
+    uint32_t page_first = 0, page_count = 0, rearms = 0;
+    bool unwatched = false, armed = false;
+  };
+  static FlatMap64<ShaderLoad> loads;
+  static const bool no_cache = std::getenv("SDNX_NO_SHADERCACHE") != nullptr;  // A/B measurements
+  ShaderLoad* load = nullptr;
+  if (!no_cache && dword_count && memory_->TranslatePhysical<const uint32_t*>(guest_address) == host_address) {
+    uint64_t lkey = uint64_t(guest_address) | uint64_t(dword_count) << 32 | uint64_t(shader_type) << 60;
+    lkey = (lkey ^ (lkey >> 29)) * 0xBF58476D1CE4E5B9ull;  // spread: the table indexes by the low bits
+    load = loads.try_emplace(lkey ^ (lkey >> 32)).first;
+    if (load->armed && !load->unwatched && PagesVersion(load->page_first, load->page_count) == load->version) {
+      ++stats_.shader_load_hits;
+      return load->shader;
+    }
+    // Pages written again since the watch was armed hold rewritten microcode (a ring, or shaders of other sizes at
+    // the same addresses every frame): those pages are not watched again, for any load, as watching them only adds
+    // write faults.
+    static FlatMap64<uint8_t> rewritten_pages;
+    auto page_key = [](uint32_t page) { return (uint64_t(page) + 1) * 0x9E3779B97F4A7C15ull; };
+    if (!load->unwatched && load->armed) {
+      for (uint32_t p = 0; p < load->page_count; ++p) rewritten_pages.try_emplace(page_key(load->page_first + p));
+      load->unwatched = true;
+    }
+    if (!load->unwatched && load->shader) {
+      const uint32_t first = (guest_address & 0x1FFFFFFFu) >> 12;
+      const uint32_t last = ((guest_address & 0x1FFFFFFFu) + dword_count * 4 - 1) >> 12;
+      for (uint32_t p = first; p <= last && !load->unwatched; ++p) {
+        if (rewritten_pages.find(page_key(p))) load->unwatched = true;
+      }
+    }
+    // Watched from the second load at this address on: microcode placed at a new address every frame (a ring)
+    // would only cost a watch and a write fault per load.
+    if (!load->unwatched && load->shader) {
+      load->armed = true;
+      const uint32_t bytes = dword_count * sizeof(uint32_t);
+      load->page_first = (guest_address & 0x1FFFFFFFu) >> 12;
+      load->page_count = (((guest_address & 0x1FFFFFFFu) + bytes - 1) >> 12) - load->page_first + 1;
+      memory_->EnablePhysicalMemoryAccessCallbacks(guest_address, bytes, true, false);
+      load->version = PagesVersion(load->page_first, load->page_count);
+      load->armed_frame = frame_;
+    }
+  }
   uint64_t hash = XXH3_64bits(host_address, dword_count * sizeof(uint32_t));
+  Shader* result;
   auto it = shaders_.find(hash);
-  if (it != shaders_.end()) return it->second.get();
-  ++stats_.shader_new;
-  auto shader = std::make_unique<Shader>(shader_type, hash, host_address, dword_count);
-  Shader* result = shader.get();
-  shaders_.emplace(hash, std::move(shader));
+  if (it != shaders_.end()) {
+    result = it->second.get();
+  } else {
+    ++stats_.shader_new;
+    auto shader = std::make_unique<Shader>(shader_type, hash, host_address, dword_count);
+    result = shader.get();
+    shaders_.emplace(hash, std::move(shader));
+  }
+  if (load) load->shader = result;
   return result;
 }
 
@@ -535,6 +588,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
 bool NativeCommandProcessor::IssueCopy() {
   ++stats_.copies;
+  ++resolve_epoch_;
   static const bool skip_resolves = std::getenv("SDNX_NO_RESOLVE") != nullptr;
   if (skip_resolves) {
     return true;
@@ -893,7 +947,7 @@ void NativeCommandProcessor::ReportStats() {
     for (uint64_t ns : stats_.prof_ns) total += double(ns);
     REXGPU_INFO("[sdnx_prof] per draw (us): state {:.2f} vertices {:.2f} (pairing {:.2f} pulled {:.2f} bindings {:.2f}) indices {:.2f} constants+textures {:.2f} "
                 "pipeline {:.2f} record {:.2f} | total {:.2f} us/draw, {:.2f} ms/frame in draws | hashed geometry: "
-                "hits {:.0f} (reused {:.0f}) fills {:.0f} ({:.2f} MB) /frame, entries {}, hashed {:.1f} MB/frame of bindings {:.1f} MB; hot refusals {:.0f}/frame, page age {:.0f} frames, strikes avg {:.1f} max {}; constants reused {:.0f}/frame, set binds skipped {:.0f}/frame",
+                "hits {:.0f} (reused {:.0f}) fills {:.0f} ({:.2f} MB) /frame, entries {}, hashed {:.1f} MB/frame of bindings {:.1f} MB; hot refusals {:.0f}/frame, page age {:.0f} frames, strikes avg {:.1f} max {}; constants reused {:.0f}/frame, set binds skipped {:.0f}/frame, texture memo hits {:.0f}/frame, shader loads without hash {:.0f}/frame",
                 stats_.prof_ns[0] * to_us / d, stats_.prof_ns[1] * to_us / d, stats_.prof_sub[0] * to_us / d,
                 stats_.prof_sub[1] * to_us / d, stats_.prof_sub[2] * to_us / d, stats_.prof_ns[2] * to_us / d,
                 stats_.prof_ns[3] * to_us / d, stats_.prof_ns[4] * to_us / d, stats_.prof_ns[5] * to_us / d,
@@ -902,7 +956,8 @@ void NativeCommandProcessor::ReportStats() {
                 stats_.hash_bytes / frames / 1048576.0, stats_.hash_whole_bytes / frames / 1048576.0, stats_.hot_checks / frames,
                 stats_.hot_checks ? double(stats_.hot_age) / stats_.hot_checks : 0.0,
                 stats_.hot_checks ? double(stats_.hot_strikes) / stats_.hot_checks : 0.0, stats_.hot_strikes_max,
-                stats_.constants_reused / frames, stats_.constants_bind_skipped / frames);
+                stats_.constants_reused / frames, stats_.constants_bind_skipped / frames, stats_.tex_memo_hits / frames,
+                stats_.shader_load_hits / frames);
   }
   stats_ = {};
   stats_start_ = now;

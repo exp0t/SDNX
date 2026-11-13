@@ -960,6 +960,18 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
 
 void NativeCommandProcessor::BindTextures(Shader* vs, Shader* ps, uint32_t* shared) {
   static string::StringBuffer disassembly;
+  // Per-frame memo of the descriptors: the same fetch constant (with the same sampler attributes of the fetch
+  // instruction) is bound by many draws of a frame, and resolving it costs several hash map lookups (resolved
+  // images, resolved copies, the R/B swap, the texture, its view, the sampler) - ~7 % of the GPU thread on the
+  // console. Valid within one frame and until the next resolve (a resolve may replace the image behind an address);
+  // a texture is revalidated against its guest pages at its first use in a frame, which is a memo miss.
+  struct Memo {
+    uint64_t key = 0, frame = UINT64_MAX, epoch = 0;
+    uint32_t index = 0, heap = 0, sampler = 0;
+    float inv_size[2] = {1.0f, 1.0f};
+  };
+  static Memo memo[1024];
+  static const bool no_memo = std::getenv("SDNX_NO_TEXMEMO") != nullptr;  // A/B measurements
   uint32_t done = 0;
   for (Shader* shader : {vs, ps}) {
     if (!shader) continue;
@@ -969,14 +981,39 @@ void NativeCommandProcessor::BindTextures(Shader* vs, Shader* ps, uint32_t* shar
       // The shared block has 16 slots per dimension (slots 16+ would overlap the next dimension's indices).
       if (slot >= 16 || (done >> slot) & 1) continue;
       done |= 1u << slot;
-      uint32_t heap = 0;
-      float inv_size[2] = {1.0f, 1.0f};
-      last_texture_format_ = VK_FORMAT_UNDEFINED;
-      uint32_t index = GetTextureDescriptor(slot, heap, inv_size);
-      shared[(heap * 64 + slot * 4) / 4] = index;
-      xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(slot);
-      shared[(192 + slot * 4) / 4] = GetSamplerDescriptor(fetch, binding.fetch_instr);
-      std::memcpy(&shared[(360 + slot * 8) / 4], inv_size, 8);
+      const auto& attr = binding.fetch_instr.attributes;
+      struct {
+        uint32_t words[6];
+        uint32_t filters;
+        float lod_bias;
+      } key_data;
+      std::memcpy(key_data.words, &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6],
+                  sizeof(key_data.words));
+      key_data.filters = uint32_t(attr.mag_filter) | uint32_t(attr.min_filter) << 8 | uint32_t(attr.mip_filter) << 16;
+      key_data.lod_bias = attr.lod_bias;
+      const uint64_t key = XXH3_64bits(&key_data, sizeof(key_data));
+      Memo& m = memo[key & 1023];
+      if (!no_memo && m.key == key && m.frame == frame_ && m.epoch == resolve_epoch_) {
+        ++stats_.tex_memo_hits;
+      } else {
+        uint32_t heap = 0;
+        float inv_size[2] = {1.0f, 1.0f};
+        last_texture_format_ = VK_FORMAT_UNDEFINED;
+        uint32_t index = GetTextureDescriptor(slot, heap, inv_size);
+        xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(slot);
+        uint32_t sampler = GetSamplerDescriptor(fetch, binding.fetch_instr);
+        m.key = key;
+        m.frame = frame_;
+        m.epoch = resolve_epoch_;
+        m.index = index;
+        m.heap = heap;
+        m.sampler = sampler;
+        m.inv_size[0] = inv_size[0];
+        m.inv_size[1] = inv_size[1];
+      }
+      shared[(m.heap * 64 + slot * 4) / 4] = m.index;
+      shared[(192 + slot * 4) / 4] = m.sampler;
+      std::memcpy(&shared[(360 + slot * 8) / 4], m.inv_size, 8);
     }
   }
 }

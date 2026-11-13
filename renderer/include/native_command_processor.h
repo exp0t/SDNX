@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/sdnx/flat_map.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
@@ -286,6 +287,7 @@ class NativeCommandProcessor : public CommandProcessor {
   // takes only parts as fresh as its base. resolved_ keeps images from long ago (menus, other scenes); one of them
   // inside the scene texture's range was pasted over the right 1/16 of the frame (lighter strip, 2026-11-12).
   std::unordered_map<uint32_t, uint64_t> resolved_frame_;
+  uint64_t resolve_epoch_ = 0;  // resolves so far: the per-frame texture descriptor memo (BindTextures) is reset by it
   std::unordered_map<uint32_t, uint32_t> resolved_extent_;  // destination base -> bytes the resolve covers  // by destination base, bumped by every resolve
   std::unordered_map<uint64_t, Texture> textures_;
   std::unordered_map<uint64_t, TextureView> views_;                  // (image, heap, swizzle) -> view
@@ -366,7 +368,7 @@ class NativeCommandProcessor : public CommandProcessor {
   uint8_t* hashed_mapping_ = nullptr;
   std::map<VkDeviceSize, VkDeviceSize> hashed_free_;
   std::array<std::vector<std::pair<VkDeviceSize, VkDeviceSize>>, kFramesInFlight> hashed_retired_;
-  std::unordered_map<uint64_t, HashedGeometry> hashed_;
+  FlatMap64<HashedGeometry> hashed_;  // flat: several lookups per draw in ~20-30k entries
   // The entry of `key` holding `content` (allocated and filled by `fill` when absent or different), or nullptr.
   HashedGeometry* HashedCopy(uint64_t key, uint64_t content, VkDeviceSize host_size, FillRef fill);
   // Same frame, stable content: the entry without hashing again (nullptr: hash and call HashedCopy).
@@ -405,7 +407,7 @@ class NativeCommandProcessor : public CommandProcessor {
     uint64_t tex_loads = 0, tex_bytes = 0, tex_resolved = 0, tex_unsupported = 0, tex_signed = 0;
     uint64_t upload_full = 0, geo_first = 0, geo_hot = 0, geo_flagged = 0, geo_changed = 0;
     uint64_t geo_hits = 0, geo_uploads = 0, geo_bytes = 0, geo_dynamic = 0, geo_direct_bytes = 0;
-    uint64_t hash_hits = 0, hash_fills = 0, hash_fill_bytes = 0, hash_bytes = 0, hash_whole_bytes = 0, hash_reuse = 0; uint64_t constants_reused = 0, constants_bind_skipped = 0; uint64_t prof_sub[3] = {};
+    uint64_t hash_hits = 0, hash_fills = 0, hash_fill_bytes = 0, hash_bytes = 0, hash_whole_bytes = 0, hash_reuse = 0; uint64_t constants_reused = 0, constants_bind_skipped = 0, tex_memo_hits = 0, shader_load_hits = 0; uint64_t prof_sub[3] = {};
     mutable uint64_t hot_checks = 0, hot_age = 0, hot_strikes = 0, hot_strikes_max = 0;  // PagesHot refusals (SDNX_PROF)  // content-hashed geometry copies
     uint64_t prof_ns[6] = {}, prof_draws = 0;  // SDNX_PROF: time of the parts of DrawNative (steady_clock ticks)
   } stats_;

@@ -95,8 +95,8 @@ NativeCommandProcessor::HashedGeometry* NativeCommandProcessor::HashedCopy(uint6
                                                                            VkDeviceSize host_size, FillRef fill) {
   static const bool disabled = std::getenv("SDNX_NO_HASHCACHE") != nullptr;  // A/B measurements
   if (disabled || !hashed_mapping_ || !host_size || host_size > kHashedBufferSize / 8) return nullptr;
-  auto [it, inserted] = hashed_.try_emplace(key);
-  HashedGeometry& entry = it->second;
+  auto [entry_ptr, inserted] = hashed_.try_emplace(key);
+  HashedGeometry& entry = *entry_ptr;
   entry.last_used = frame_;
   if (!inserted && entry.offset != UINT64_MAX && entry.content == content && entry.size >= host_size) {
     ++stats_.hash_hits;
@@ -110,7 +110,7 @@ NativeCommandProcessor::HashedGeometry* NativeCommandProcessor::HashedCopy(uint6
   }
   VkDeviceSize offset = AllocateFrom(hashed_free_, host_size);
   if (offset == UINT64_MAX) {
-    hashed_.erase(it);
+    hashed_.erase(key);
     return nullptr;
   }
   fill(hashed_mapping_ + offset);
@@ -130,9 +130,9 @@ NativeCommandProcessor::HashedGeometry* NativeCommandProcessor::HashedCopy(uint6
 NativeCommandProcessor::HashedGeometry* NativeCommandProcessor::HashedReuse(uint64_t key, VkDeviceSize host_size) {
   static const bool disabled = std::getenv("SDNX_NO_HASHREUSE") != nullptr;  // A/B measurements
   if (disabled) return nullptr;
-  auto it = hashed_.find(key);
-  if (it == hashed_.end()) return nullptr;
-  HashedGeometry& entry = it->second;
+  HashedGeometry* found = hashed_.find(key);
+  if (!found) return nullptr;
+  HashedGeometry& entry = *found;
   if (entry.offset == UINT64_MAX || entry.size < host_size || entry.hashed_frame != frame_ ||
       frame_ - entry.content_since < kHashedStableFrames) {
     return nullptr;
@@ -198,14 +198,11 @@ void NativeCommandProcessor::ReleaseRetiredGeometry(uint32_t slot) {
   hashed_retired_[slot].clear();
   // Eviction (every 64 frames): ring-buffer addresses seen once and geometry no longer drawn.
   if (frame_ % 64) return;
-  for (auto it = hashed_.begin(); it != hashed_.end();) {
-    if (frame_ - it->second.last_used > kHashedEvictFrames) {
-      if (it->second.offset != UINT64_MAX) hashed_retired_[slot].push_back({it->second.offset, it->second.size});
-      it = hashed_.erase(it);
-    } else {
-      ++it;
-    }
-  }
+  hashed_.erase_if([&](uint64_t, HashedGeometry& entry) {
+    if (frame_ - entry.last_used <= kHashedEvictFrames) return false;
+    if (entry.offset != UINT64_MAX) hashed_retired_[slot].push_back({entry.offset, entry.size});
+    return true;
+  });
   for (auto it = geometry_.begin(); it != geometry_.end();) {
     if (frame_ - it->second.last_used > kEvictFrames) {
       if (it->second.offset != UINT64_MAX) geometry_retired_[slot].push_back({it->second.offset, it->second.size});
