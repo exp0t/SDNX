@@ -12,6 +12,8 @@
  */
 #include <rex/graphics/sdnx/native_command_processor.h>
 
+#include "vulkan_backend.h"
+
 #include <algorithm>
 #include <cstdlib>
 
@@ -75,23 +77,13 @@ bool NativeCommandProcessor::InitializeGeometry() {
   // is turned on. On the console that memory ran out after ~6 minutes of gameplay.
   geometry_free_.clear();
   if (std::getenv("SDNX_GEOCACHE")) {
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            device, kGeometryBufferSize,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            ui::vulkan::util::MemoryPurpose::kDeviceLocal, geometry_buffer_, geometry_memory_, &memory_type)) {
-      return false;
-    }
+    geometry_gpu_ = backend_->CreateBuffer(kGeometryBufferSize, BufferUsage::kDeviceLocal, nullptr);
+    if (!geometry_gpu_) return false;
     geometry_free_[0] = kGeometryBufferSize;
   }
-  if (ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          device, kHashedBufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-          ui::vulkan::util::MemoryPurpose::kUpload, hashed_buffer_, hashed_memory_, &memory_type)) {
-    void* mapping = nullptr;
-    device->functions().vkMapMemory(device->device(), hashed_memory_, 0, VK_WHOLE_SIZE, 0, &mapping);
-    hashed_mapping_ = static_cast<uint8_t*>(mapping);
-    hashed_free_.clear();
-    if (hashed_mapping_) hashed_free_[0] = kHashedBufferSize;
-  }
+  hashed_gpu_ = backend_->CreateBuffer(kHashedBufferSize, BufferUsage::kGeometry, &hashed_mapping_);
+  hashed_free_.clear();
+  if (hashed_gpu_ && hashed_mapping_) hashed_free_[0] = kHashedBufferSize;
   return true;
 }
 
@@ -147,16 +139,10 @@ NativeCommandProcessor::HashedGeometry* NativeCommandProcessor::HashedReuse(uint
 }
 
 void NativeCommandProcessor::ShutdownGeometry() {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  if (geometry_buffer_) dfn.vkDestroyBuffer(device->device(), geometry_buffer_, nullptr);
-  if (geometry_memory_) dfn.vkFreeMemory(device->device(), geometry_memory_, nullptr);
-  geometry_buffer_ = VK_NULL_HANDLE;
-  geometry_memory_ = VK_NULL_HANDLE;
-  if (hashed_buffer_) dfn.vkDestroyBuffer(device->device(), hashed_buffer_, nullptr);
-  if (hashed_memory_) dfn.vkFreeMemory(device->device(), hashed_memory_, nullptr);
-  hashed_buffer_ = VK_NULL_HANDLE;
-  hashed_memory_ = VK_NULL_HANDLE;
+  backend_->DestroyBuffer(geometry_gpu_);
+  geometry_gpu_ = nullptr;
+  backend_->DestroyBuffer(hashed_gpu_);
+  hashed_gpu_ = nullptr;
   hashed_mapping_ = nullptr;
   hashed_.clear();
   hashed_free_.clear();
@@ -243,7 +229,7 @@ VkDeviceSize NativeCommandProcessor::CachedGeometry(uint64_t key, uint32_t addre
   // second, so every buffer was refused as hot (0 hits of ~3800 lookups/frame) and the lookup itself cost ~0.1 us/draw;
   // the content-hashed copies (HashedCopy / HashedReuse) serve all geometry.
   static const bool disabled = std::getenv("SDNX_GEOCACHE") == nullptr;
-  if (disabled || !geometry_buffer_ || !size || !host_size || host_size > kGeometryBufferSize / 4) return UINT64_MAX;
+  if (disabled || !geometry_gpu_ || !size || !host_size || host_size > kGeometryBufferSize / 4) return UINT64_MAX;
   auto [entry_it, inserted] = geometry_.try_emplace(key);
   GeometryEntry& entry = entry_it->second;
   entry.last_used = frame_;
@@ -330,9 +316,8 @@ VkDeviceSize NativeCommandProcessor::CachedGeometry(uint64_t key, uint32_t addre
   }
   fill(staging_data);
   EndRendering();  // copies are not allowed inside a rendering pass; the next pass begins with a full barrier
-  VkBufferCopy copy = {staging, offset, host_size};
-  vulkan_device()->functions().vkCmdCopyBuffer(cb_, upload_[uint32_t(frame_ % kFramesInFlight)].buffer,
-                                               geometry_buffer_, 1, &copy);
+  backend_->CopyBuffer({upload_[uint32_t(frame_ % kFramesInFlight)].gpu, staging}, {geometry_gpu_, offset},
+                       host_size);
   transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   entry.offset = offset;
   entry.size = host_size;

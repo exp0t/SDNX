@@ -71,3 +71,9 @@ while read -r kind key name rest; do
   echo "$kind $key $name $rest" | sed 's/ *$//' >> "$PKG/index.txt"
 done < <(tr -d '\r' < "$INT/index.txt")
 echo "internal shaders added from $INT"
+
+# 7. deko3d package for the Switch deko3d backend: the same HLSL with -DSDNX_DEKO3D (shader_common.h) -> SPIR-V ->
+#    GLSL -> uam -> DKSH, one per package entry (game and internal), plus each shader's texture bindings.
+#    Needs ~/tools/uam (from the devkitA64 image) and ~/tools/spirv-cross-build/spirv-cross.
+DKPKG=${DKPKG:-$W/dksh}
+python3 /mnt/d/CODE/SDNX/nx/shaders/tools/dk_build.py "$PKG" "$W/hlsl" "$DKPKG"

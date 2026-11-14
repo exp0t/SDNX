@@ -35,6 +35,7 @@
 #include <rex/ui/vulkan/util.h>
 
 #include "shaders/present_cs.h"
+#include "vulkan_backend.h"
 
 namespace rex::graphics::sdnx {
 
@@ -156,46 +157,24 @@ bool NativeCommandProcessor::CreateImage(Image& image, VkFormat format, uint32_t
   if (trace_image) {
     REXGPU_INFO("[sdnx_trace] create image {}x{} format {} depth={}", width, height, int(format), depth);
   }
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  VkImageCreateInfo info = {};
-  info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-  info.imageType = VK_IMAGE_TYPE_2D;
-  info.format = format;
-  info.extent = {width, height, 1};
-  info.mipLevels = 1;
-  info.arrayLayers = 1;
-  info.samples = VK_SAMPLE_COUNT_1_BIT;
-  info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-               (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (trace_image) {
-    REXGPU_INFO("[sdnx_trace]   vkCreateImage {}x{} format {} usage {:#x}", width, height, int(format), info.usage);
-  }
-  if (!ui::vulkan::util::CreateDedicatedAllocationImage(device, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
-                                                        image.image, image.memory)) {
+  ImageDesc desc;
+  desc.format = format;
+  desc.width = width;
+  desc.height = height;
+  desc.render_target = !depth;
+  desc.depth_stencil = depth;
+  image.gpu = backend_->CreateImage(desc);
+  if (!image.gpu) {
     REXGPU_ERROR("[sdnx_native] could not create a {}x{} image (format {})", width, height, int(format));
     return false;
   }
+  image.image = image.gpu->image;
+  image.view = image.gpu->view;
   image.format = format;
   image.width = width;
   image.height = height;
-  image.aspect = depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+  image.aspect = image.gpu->aspect;
   image.initialized = false;
-  VkImageViewCreateInfo view = {};
-  view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-  view.image = image.image;
-  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  view.format = format;
-  view.subresourceRange = {
-      depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
-            : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT),
-      0, 1, 0, 1};
-  if (trace_image) {
-    REXGPU_INFO("[sdnx_trace]   vkCreateImageView aspect={:#x}", uint32_t(view.subresourceRange.aspectMask));
-  }
-  device->functions().vkCreateImageView(device->device(), &view, nullptr, &image.view);
   if (trace_image) {
     REXGPU_INFO("[sdnx_trace]   image ready");
   }
@@ -203,6 +182,11 @@ bool NativeCommandProcessor::CreateImage(Image& image, VkFormat format, uint32_t
 }
 
 void NativeCommandProcessor::DestroyImage(Image& image) {
+  if (image.gpu) {
+    backend_->DestroyImage(image.gpu);
+    image = Image();
+    return;
+  }
   const ui::vulkan::VulkanDevice* device = vulkan_device();
   const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
   if (image.view) dfn.vkDestroyImageView(device->device(), image.view, nullptr);
@@ -213,6 +197,13 @@ void NativeCommandProcessor::DestroyImage(Image& image) {
 
 void NativeCommandProcessor::InitializeLayout(Image& image) {
   if (image.initialized) return;
+  if (image.gpu) {
+    backend_->InitializeImage(image.gpu, image.gpu->desc, true);
+    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
+    FullBarrier();
+    image.initialized = true;
+    return;
+  }
   VkImageMemoryBarrier barrier = {};
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -260,13 +251,7 @@ void NativeCommandProcessor::FullBarrier(int line, const char* file) {
     base = base2 > base ? base2 : base;
     ++barrier_sites_[std::string(base ? base + 1 : file) + ":" + std::to_string(line)];
   }
-  VkMemoryBarrier barrier = {};
-  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-  vulkan_device()->functions().vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr,
-                                                    0, nullptr);
+  backend_->FullBarrier();
   // Everything recorded before is ordered with everything after: no pending transfer, no attachment hazard left.
   transfer_pending_ = false;
   attachments_written_.clear();
@@ -277,15 +262,7 @@ void NativeCommandProcessor::FullBarrier(int line, const char* file) {
 // transfers (resolves, uploads), which set transfer_pending_ and get the full barrier.
 void NativeCommandProcessor::AttachmentBarrier() {
   ++stats_.attachment_barriers;
-  constexpr VkPipelineStageFlags kStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                                           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-  VkMemoryBarrier barrier = {};
-  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-  vulkan_device()->functions().vkCmdPipelineBarrier(cb_, kStages, kStages, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+  backend_->AttachmentBarrier();
   attachments_written_.clear();
 }
 
@@ -429,25 +406,11 @@ bool NativeCommandProcessor::CreatePresentPipeline() {
 }
 
 bool NativeCommandProcessor::SetupContext() {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  VkCommandPoolCreateInfo pool_info = {};
-  pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-  pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-  pool_info.queueFamilyIndex = device->queue_family_graphics_compute();
-  if (dfn.vkCreateCommandPool(device->device(), &pool_info, nullptr, &command_pool_) != VK_SUCCESS) return false;
-  VkCommandBufferAllocateInfo alloc_info = {};
-  alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-  alloc_info.commandPool = command_pool_;
-  alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  alloc_info.commandBufferCount = kFramesInFlight;
-  if (dfn.vkAllocateCommandBuffers(device->device(), &alloc_info, command_buffers_.data()) != VK_SUCCESS)
+  static_assert(kFramesInFlight == GpuBackend::kFramesInFlight);
+  backend_ = std::make_unique<VulkanBackend>(vulkan_device());
+  if (!backend_->Initialize()) {
+    REXGPU_ERROR("[sdnx_native] could not start the {} backend", backend_->name());
     return false;
-  VkFenceCreateInfo fence_info = {};
-  fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-  fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-  for (VkFence& fence : fences_) {
-    if (dfn.vkCreateFence(device->device(), &fence_info, nullptr, &fence) != VK_SUCCESS) return false;
   }
   if (!CreatePresentPipeline()) {
     REXGPU_ERROR("[sdnx_native] could not create the output pipeline");
@@ -485,28 +448,17 @@ void NativeCommandProcessor::ShutdownContext() {
   if (present_pipeline_) dfn.vkDestroyPipeline(device->device(), present_pipeline_, nullptr);
   if (present_pipeline_layout_) dfn.vkDestroyPipelineLayout(device->device(), present_pipeline_layout_, nullptr);
   if (present_set_layout_) dfn.vkDestroyDescriptorSetLayout(device->device(), present_set_layout_, nullptr);
-  for (VkFence& fence : fences_) {
-    if (fence) dfn.vkDestroyFence(device->device(), fence, nullptr);
-    fence = VK_NULL_HANDLE;
-  }
-  if (command_pool_) dfn.vkDestroyCommandPool(device->device(), command_pool_, nullptr);
-  command_pool_ = VK_NULL_HANDLE;
+  backend_->Shutdown();
+  backend_.reset();
   shaders_.clear();
 }
 
 void NativeCommandProcessor::EnsureFrame() {
   if (frame_open_) return;
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
   uint32_t slot = uint32_t(frame_ % kFramesInFlight);
-  dfn.vkWaitForFences(device->device(), 1, &fences_[slot], VK_TRUE, UINT64_MAX);
-  dfn.vkResetFences(device->device(), 1, &fences_[slot]);
-  cb_ = command_buffers_[slot];
-  VkCommandBufferBeginInfo begin = {};
-  begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  dfn.vkBeginCommandBuffer(cb_, &begin);  // resets it (pool created with RESET_COMMAND_BUFFER_BIT)
-  bound_ = {};  // nothing is bound in a new command buffer
+  backend_->BeginFrame(slot);  // waits for the slot's fence
+  LumaCheck(slot);  // the slot's previous frame has completed: its presented image is in the readback buffer
+  cb_ = backend_->command_buffer();
   transfer_pending_ = true;  // first pass of a command buffer: full barrier (earlier submissions)
   upload_[slot].offset = 0;
   frame_open_ = true;
@@ -522,20 +474,11 @@ void NativeCommandProcessor::EnsureFrame() {
     // UNDEFINED, so the shaders sampled undefined data (zero on NVIDIA): textured UI came out black.
     dummies_initialized_ = true;
     for (Image* dummy : {&dummy_2d_, &dummy_3d_, &dummy_cube_}) {
-      uint32_t layers = dummy == &dummy_cube_ ? 6 : 1;
-      VkImageMemoryBarrier barrier = {};
-      barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-      barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-      barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-      barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barrier.image = dummy->image;
-      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
-      dfn.vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
-                               0, nullptr, 1, &barrier);
-      VkClearColorValue white = {{1.0f, 1.0f, 1.0f, 1.0f}};
-      dfn.vkCmdClearColorImage(cb_, dummy->image, VK_IMAGE_LAYOUT_GENERAL, &white, 1, &barrier.subresourceRange);
+      backend_->InitializeImage(dummy->gpu, dummy->gpu->desc, false);
+      ImageRegion all;
+      all.layer_count = dummy == &dummy_cube_ ? 6 : 1;
+      const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+      backend_->ClearColor(dummy->gpu, all, white);
       transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
       dummy->initialized = true;
     }
@@ -547,22 +490,11 @@ bool NativeCommandProcessor::SubmitFrame() {
   if (!frame_open_) return true;
   EndRendering();
   CopyQueryResults(uint32_t(frame_ % kFramesInFlight));
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  dfn.vkEndCommandBuffer(cb_);
-  VkSubmitInfo submit = {};
-  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &cb_;
-  VkResult result;
-  {
-    auto queue = device->AcquireQueue(device->queue_family_graphics_compute(), 0);
-    result = dfn.vkQueueSubmit(queue.queue(), 1, &submit, fences_[uint32_t(frame_ % kFramesInFlight)]);
-  }
+  const bool result = backend_->SubmitFrame(uint32_t(frame_ % kFramesInFlight));
   frame_open_ = false;
   cb_ = VK_NULL_HANDLE;
   ++frame_;
-  return result == VK_SUCCESS;
+  return result;
 }
 
 Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
@@ -752,24 +684,23 @@ bool NativeCommandProcessor::IssueCopy() {
                         reinterpret_cast<uintptr_t>(source), original_base, int(source->format), pitch,
                         uint32_t(msaa), uint32_t(source->drawn), dest_base, width, height);
           }
-          VkImageBlit blit = {};
-          blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
           // The source is in samples (MSAA surfaces are larger): the blit downsamples.
-          blit.srcOffsets[0] = {int32_t(x0 << sx), int32_t(y0 << sy), 0};
-          blit.srcOffsets[1] = {int32_t(std::min((x0 + width) << sx, source->width)),
-                                int32_t(std::min((y0 + height) << sy, source->height)), 1};
-          blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-          blit.dstOffsets[0] = {int32_t(dx), int32_t(dy), 0};
-          uint32_t copy_w = uint32_t(blit.srcOffsets[1].x - blit.srcOffsets[0].x) >> sx;
-          uint32_t copy_h = uint32_t(blit.srcOffsets[1].y - blit.srcOffsets[0].y) >> sy;
+          uint32_t src_x = x0 << sx, src_y = y0 << sy;
+          uint32_t copy_w = (std::min((x0 + width) << sx, source->width) - std::min(src_x, source->width)) >> sx;
+          uint32_t copy_h = (std::min((y0 + height) << sy, source->height) - std::min(src_y, source->height)) >> sy;
           copy_w = std::min(copy_w, dest->width > dx ? dest->width - dx : 0u);
           copy_h = std::min(copy_h, dest->height > dy ? dest->height - dy : 0u);
-          blit.dstOffsets[1] = {int32_t(dx + copy_w), int32_t(dy + copy_h), 1};
-          blit.srcOffsets[1].x = blit.srcOffsets[0].x + int32_t(copy_w << sx);
-          blit.srcOffsets[1].y = blit.srcOffsets[0].y + int32_t(copy_h << sy);
           if (copy_w && copy_h) {
-            dfn.vkCmdBlitImage(cb_, source->image, VK_IMAGE_LAYOUT_GENERAL, dest->image, VK_IMAGE_LAYOUT_GENERAL,
-                               1, &blit, (sx || sy) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+            ImageRegion from, to;
+            from.x = int32_t(src_x);
+            from.y = int32_t(src_y);
+            from.width = copy_w << sx;
+            from.height = copy_h << sy;
+            to.x = int32_t(dx);
+            to.y = int32_t(dy);
+            to.width = copy_w;
+            to.height = copy_h;
+            backend_->BlitImage(source->gpu, from, dest->gpu, to, Aspect::kColor, sx || sy);
             transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
           }
         }
@@ -787,7 +718,6 @@ bool NativeCommandProcessor::IssueCopy() {
       FullBarrier();
       VkClearColorValue color = DecodeColorClear(xenos::ColorRenderTargetFormat(info.color_edram_info.format),
                                                  info.rb_color_clear, info.rb_color_clear_lo);
-      VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
       // vkCmdClearColorImage clears the whole image; the resolve rectangle is the whole target in practice.
       // EDRAM is one memory: a clear through one format also clears the surfaces of other formats at the same
       // base and pitch. Images are per format here, so clear all of them - otherwise what was drawn through
@@ -796,7 +726,7 @@ bool NativeCommandProcessor::IssueCopy() {
       for (auto& it : render_targets_) {
         bool is_depth = (it.first >> 38) & 1;
         if (is_depth || (it.first & 0xFFFFFFF) != base_pitch || !it.second.image) continue;
-        dfn.vkCmdClearColorImage(cb_, it.second.image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+        backend_->ClearColor(it.second.gpu, ImageRegion(), color.float32);
         transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
         ++stats_.clears;
       }
@@ -807,10 +737,8 @@ bool NativeCommandProcessor::IssueCopy() {
                                     uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format), msaa, true, y0 + height);
     if (target) {
       FullBarrier();
-      VkClearDepthStencilValue ds = {float(info.rb_depth_clear >> 8) / float(0xFFFFFF),
-                                     info.rb_depth_clear & 0xFF};
-      VkImageSubresourceRange range = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
-      dfn.vkCmdClearDepthStencilImage(cb_, target->image, VK_IMAGE_LAYOUT_GENERAL, &ds, 1, &range);
+      backend_->ClearDepthStencil(target->gpu, ImageRegion(), Aspect::kDepthStencil,
+                                  float(info.rb_depth_clear >> 8) / float(0xFFFFFF), info.rb_depth_clear & 0xFF);
       transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
       ++stats_.clears;
     }
@@ -821,8 +749,6 @@ bool NativeCommandProcessor::IssueCopy() {
 void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::ResolveInfo& info, uint32_t x0,
                                           uint32_t y0, uint32_t width, uint32_t height, uint32_t sx,
                                           uint32_t sy) {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
   uint32_t dest_base = (*register_file_)[XE_GPU_REG_RB_COPY_DEST_BASE] & 0x1FFFFFFF;
   uint32_t dest_w = info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32;
   uint32_t dest_h = info.copy_dest_coordinate_info.height_aligned_div_32 * 32;
@@ -834,7 +760,8 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
   resolved_frame_[dest_base] = frame_;
   resolved_extent_[dest_base] = info.copy_dest_extent_start + info.copy_dest_extent_length - dest_base;
   if (log_frame_) {
-    REXGPU_INFO("[sdnx_frame] depth resolve {}x{} at {},{} (samples x{} y{}) -> {:#x} at {},{}", width, height, x0,
+    REXGPU_INFO("[sdnx_frame] depth resolve (depth format {}) {}x{} at {},{} (samples x{} y{}) -> {:#x} at {},{}",
+                uint32_t(register_file_->Get<reg::RB_DEPTH_INFO>().depth_format), width, height, x0,
                 y0, 1u << sx, 1u << sy, dest_base, dx, dy);
   }
   if (!dest) return;
@@ -849,21 +776,21 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
   src_h = out_h << sy;
   VkDeviceSize offset = Upload(nullptr, VkDeviceSize(src_w) * src_h * 4, 16);
   if (offset == UINT64_MAX) return;
-  VkBuffer buffer = upload_[uint32_t(frame_ % kFramesInFlight)].buffer;
+  GpuBuffer* buffer = upload_[uint32_t(frame_ % kFramesInFlight)].gpu;
   EndRendering();
   FullBarrier();
-  VkBufferImageCopy region = {};
-  region.bufferOffset = offset;
-  region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-  region.imageOffset = {int32_t(src_x), int32_t(src_y), 0};
-  region.imageExtent = {src_w, src_h, 1};
-  dfn.vkCmdCopyImageToBuffer(cb_, source.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &region);
+  ImageRegion region;
+  region.x = int32_t(src_x);
+  region.y = int32_t(src_y);
+  region.width = src_w;
+  region.height = src_h;
+  backend_->CopyImageToBuffer(source.gpu, region, Aspect::kDepth, {buffer, offset}, 0);
   transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   FullBarrier();
-  region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   if (!sx && !sy) {
-    region.imageOffset = {int32_t(dx), int32_t(dy), 0};
-    dfn.vkCmdCopyBufferToImage(cb_, buffer, dest->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    region.x = int32_t(dx);
+    region.y = int32_t(dy);
+    backend_->CopyBufferToImage({buffer, offset}, 0, 0, dest->gpu, region, Aspect::kColor);
     transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     // Stencil, for TryRestoreDepth.
     Image& stencil = resolved_stencil_[dest_base];
@@ -874,17 +801,17 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
     VkDeviceSize stencil_offset = stencil.image ? Upload(nullptr, VkDeviceSize(src_w) * src_h, 16) : UINT64_MAX;
     if (stencil_offset != UINT64_MAX) {
       FullBarrier();
-      VkBufferImageCopy s_region = {};
-      s_region.bufferOffset = stencil_offset;
-      s_region.imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
-      s_region.imageOffset = {int32_t(src_x), int32_t(src_y), 0};
-      s_region.imageExtent = {src_w, src_h, 1};
-      dfn.vkCmdCopyImageToBuffer(cb_, source.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &s_region);
+      ImageRegion s_region;
+      s_region.x = int32_t(src_x);
+      s_region.y = int32_t(src_y);
+      s_region.width = src_w;
+      s_region.height = src_h;
+      backend_->CopyImageToBuffer(source.gpu, s_region, Aspect::kStencil, {buffer, stencil_offset}, 0);
       transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
       FullBarrier();
-      s_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      s_region.imageOffset = {int32_t(dx), int32_t(dy), 0};
-      dfn.vkCmdCopyBufferToImage(cb_, buffer, stencil.image, VK_IMAGE_LAYOUT_GENERAL, 1, &s_region);
+      s_region.x = int32_t(dx);
+      s_region.y = int32_t(dy);
+      backend_->CopyBufferToImage({buffer, stencil_offset}, 0, 0, stencil.gpu, s_region, Aspect::kColor);
       transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     }
   } else {
@@ -894,18 +821,17 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
       if (!CreateImage(depth_resolve_temp_, VK_FORMAT_R32_SFLOAT, tw, th, false)) return;
       InitializeLayout(depth_resolve_temp_);
     }
-    region.imageOffset = {0, 0, 0};
-    dfn.vkCmdCopyBufferToImage(cb_, buffer, depth_resolve_temp_.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    region.x = 0;
+    region.y = 0;
+    backend_->CopyBufferToImage({buffer, offset}, 0, 0, depth_resolve_temp_.gpu, region, Aspect::kColor);
     transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     FullBarrier();
-    VkImageBlit blit = {};
-    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.srcOffsets[1] = {int32_t(src_w), int32_t(src_h), 1};
-    blit.dstSubresource = blit.srcSubresource;
-    blit.dstOffsets[0] = {int32_t(dx), int32_t(dy), 0};
-    blit.dstOffsets[1] = {int32_t(dx + out_w), int32_t(dy + out_h), 1};
-    dfn.vkCmdBlitImage(cb_, depth_resolve_temp_.image, VK_IMAGE_LAYOUT_GENERAL, dest->image, VK_IMAGE_LAYOUT_GENERAL,
-                       1, &blit, VK_FILTER_NEAREST);
+    ImageRegion to;
+    to.x = int32_t(dx);
+    to.y = int32_t(dy);
+    to.width = out_w;
+    to.height = out_h;
+    backend_->BlitImage(depth_resolve_temp_.gpu, region, dest->gpu, to, Aspect::kColor, false);
     transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   }
   FullBarrier();
@@ -938,10 +864,9 @@ bool NativeCommandProcessor::TryRestoreDepth(Shader* ps) {
   uint32_t tw = fetch.size_2d.width + 1, th = fetch.size_2d.height + 1;
   Image* target = GetRenderTarget(color_info.color_base, pitch, 0, xenos::MsaaSamples::k1X, true, th);
   if (!target) return false;
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device()->functions();
   EnsureFrame();
   EndRendering();
-  VkBuffer buffer = upload_[uint32_t(frame_ % kFramesInFlight)].buffer;
+  GpuBuffer* buffer = upload_[uint32_t(frame_ % kFramesInFlight)].gpu;
   uint32_t pitch_pixels = fetch.pitch ? uint32_t(fetch.pitch) << 5 : ((tw + 31) & ~31u);
   uint64_t row_bytes = uint64_t(pitch_pixels) * 4;
   for (const auto& part : resolved_) {
@@ -955,16 +880,16 @@ bool NativeCommandProcessor::TryRestoreDepth(Shader* ps) {
     VkDeviceSize offset = Upload(nullptr, VkDeviceSize(w) * h * 4, 16);
     if (offset == UINT64_MAX) continue;
     FullBarrier();
-    VkBufferImageCopy region = {};
-    region.bufferOffset = offset;
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {w, h, 1};
-    dfn.vkCmdCopyImageToBuffer(cb_, part.second.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &region);
+    ImageRegion region;
+    region.width = w;
+    region.height = h;
+    backend_->CopyImageToBuffer(part.second.gpu, region, Aspect::kColor, {buffer, offset}, 0);
     transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     FullBarrier();
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    region.imageOffset = {int32_t(x), int32_t(y), 0};
-    dfn.vkCmdCopyBufferToImage(cb_, buffer, target->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    ImageRegion at = region;
+    at.x = int32_t(x);
+    at.y = int32_t(y);
+    backend_->CopyBufferToImage({buffer, offset}, 0, 0, target->gpu, at, Aspect::kDepth);
     transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     auto stencil = resolved_stencil_.find(part.first);
     if (stencil == resolved_stencil_.end() || !stencil->second.image) continue;
@@ -972,22 +897,21 @@ bool NativeCommandProcessor::TryRestoreDepth(Shader* ps) {
     h = std::min(h, stencil->second.height);
     offset = Upload(nullptr, VkDeviceSize(w) * h, 16);
     if (offset == UINT64_MAX) continue;
-    region.bufferOffset = offset;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageOffset = {0, 0, 0};
-    region.imageExtent = {w, h, 1};
-    dfn.vkCmdCopyImageToBuffer(cb_, stencil->second.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &region);
+    region.width = w;
+    region.height = h;
+    backend_->CopyImageToBuffer(stencil->second.gpu, region, Aspect::kColor, {buffer, offset}, 0);
     transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     FullBarrier();
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-    region.imageOffset = {int32_t(x), int32_t(y), 0};
-    dfn.vkCmdCopyBufferToImage(cb_, buffer, target->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    at = region;
+    at.x = int32_t(x);
+    at.y = int32_t(y);
+    backend_->CopyBufferToImage({buffer, offset}, 0, 0, target->gpu, at, Aspect::kStencil);
     transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   }
   FullBarrier();
   if (log_frame_) {
-    REXGPU_INFO("[sdnx_frame] depth restore from {:#x} ({}x{}) to depth base {} pitch {}", base, tw, th,
-                uint32_t(color_info.color_base), pitch);
+    REXGPU_INFO("[sdnx_frame] depth restore from {:#x} ({}x{}) to depth base {} pitch {} (image {:#x})", base, tw,
+                th, uint32_t(color_info.color_base), pitch, uint64_t(reinterpret_cast<uintptr_t>(target->image)));
   }
   return true;
 }
@@ -1009,7 +933,7 @@ void NativeCommandProcessor::ReportStats() {
       stats_.copies_depth / frames, stats_.clears / frames, 100.0 * stats_.front_found / frames,
       stats_.shader_loads / frames, stats_.shader_new, shaders_.size(), render_targets_.size(), resolved_.size(),
       stats_.drawn / frames, stats_.pulled / frames, stats_.missing_vs / frames, stats_.missing_ps / frames, stats_.skipped / frames,
-      stats_.new_pipelines, stats_.geo_hits / frames, stats_.geo_uploads / frames,
+      backend_->pipelines_created(), stats_.geo_hits / frames, stats_.geo_uploads / frames,
       stats_.geo_bytes / frames / 1048576.0, stats_.geo_dynamic / frames, stats_.geo_direct_bytes / frames / 1048576.0,
       geometry_.size(), stats_.upload_full / frames, stats_.geo_first / frames, stats_.geo_hot / frames,
       stats_.geo_flagged / frames, stats_.geo_changed / frames,
@@ -1023,6 +947,13 @@ void NativeCommandProcessor::ReportStats() {
     const double d = double(stats_.prof_draws);
     double total = 0;
     for (uint64_t ns : stats_.prof_ns) total += double(ns);
+    {
+      // The backend counts the draws whose constants set stayed bound (cumulative): this report's share.
+      static uint64_t reported = 0;
+      const uint64_t now = backend_->constants_bind_skipped();
+      stats_.constants_bind_skipped = now - reported;
+      reported = now;
+    }
     REXGPU_INFO("[sdnx_prof] per draw (us): state {:.2f} vertices {:.2f} (pairing {:.2f} pulled {:.2f} bindings {:.2f}) indices {:.2f} constants+textures {:.2f} "
                 "pipeline {:.2f} record {:.2f} | total {:.2f} us/draw, {:.2f} ms/frame in draws | hashed geometry: "
                 "hits {:.0f} (reused {:.0f}) fills {:.0f} ({:.2f} MB) /frame, entries {}, hashed {:.1f} MB/frame of bindings {:.1f} MB; hot refusals {:.0f}/frame, page age {:.0f} frames, strikes avg {:.1f} max {}; constants reused {:.0f}/frame, set binds skipped {:.0f}/frame, texture memo hits {:.0f}/frame, shader loads without hash {:.0f}/frame, full barriers {:.0f}/frame (attachment {:.0f}, none {:.0f}), textures evicted {}, textures {}",
@@ -1051,6 +982,65 @@ void NativeCommandProcessor::ReportStats() {
   }
   stats_ = {};
   stats_start_ = now;
+}
+
+// SDNX_LUMA_LOG=1 (bench diagnostic): the mean brightness of every presented frame, read back three frames later
+// (when its slot's fence has been waited for); a frame much brighter than the ones before is logged. Made to catch
+// the single white scene frames seen on the console (HUD drawn over a white 3D image, 2026-11-13).
+void NativeCommandProcessor::LumaRecord(const Image& front) {
+  static const bool enabled = std::getenv("SDNX_LUMA_LOG") != nullptr;
+  if (!enabled || front.format != VK_FORMAT_R8G8B8A8_UNORM) return;
+  const ui::vulkan::VulkanDevice* device = vulkan_device();
+  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
+  uint32_t slot = uint32_t(frame_ % kFramesInFlight);
+  LumaSlot& s = luma_slots_[slot];
+  VkDeviceSize size = VkDeviceSize(front.width) * front.height * 4;
+  if (!s.buffer || s.size < size) {
+    if (s.buffer) return;  // size changed: skip (rare)
+    uint32_t memory_type = 0;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                           ui::vulkan::util::MemoryPurpose::kReadback, s.buffer,
+                                                           s.memory, &memory_type)) {
+      return;
+    }
+    dfn.vkMapMemory(device->device(), s.memory, 0, VK_WHOLE_SIZE, 0, &s.mapping);
+    s.size = size;
+  }
+  EndRendering();
+  FullBarrier();
+  VkBufferImageCopy region = {};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {front.width, front.height, 1};
+  dfn.vkCmdCopyImageToBuffer(cb_, front.image, VK_IMAGE_LAYOUT_GENERAL, s.buffer, 1, &region);
+  transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
+  s.pending = true;
+  s.width = front.width;
+  s.height = front.height;
+  s.swap = stats_total_swaps_;
+}
+
+void NativeCommandProcessor::LumaCheck(uint32_t slot) {
+  LumaSlot& s = luma_slots_[slot];
+  if (!s.pending || !s.mapping) return;
+  s.pending = false;
+  const uint8_t* p = static_cast<const uint8_t*>(s.mapping);
+  uint64_t sum = 0, count = 0;
+  for (uint32_t y = 0; y < s.height; y += 8) {
+    const uint8_t* row = p + size_t(y) * s.width * 4;
+    for (uint32_t x = 0; x < s.width; x += 8, ++count) sum += row[x * 4] + row[x * 4 + 1] + row[x * 4 + 2];
+  }
+  double mean = count ? double(sum) / double(count * 3) : 0.0;
+  double average = luma_history_count_ ? luma_history_sum_ / luma_history_count_ : mean;
+  if (luma_history_count_ >= 8 && mean - average > 60.0) {
+    REXGPU_WARN("[sdnx_luma] bright frame: swap {} mean {:.1f} (recent average {:.1f})", s.swap, mean, average);
+  }
+  // Running average of the last ~30 frames (exponential).
+  if (luma_history_count_ < 30) {
+    luma_history_sum_ += mean;
+    ++luma_history_count_;
+  } else {
+    luma_history_sum_ += mean - luma_history_sum_ / luma_history_count_;
+  }
 }
 
 void NativeCommandProcessor::BeginFrontDump(const Image& front) {
@@ -1084,6 +1074,7 @@ void NativeCommandProcessor::BeginFrontDump(const Image& front) {
   dump_width_ = front.width;
   dump_height_ = front.height;
   dump_bpp_ = bpp;
+  dump_float_ = front.format == VK_FORMAT_R32_SFLOAT;
   FullBarrier();
   VkBufferImageCopy region = {};
   region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -1114,6 +1105,7 @@ void NativeCommandProcessor::FinishFrontDump() {
   if (!data) return;
   double sum[3] = {0, 0, 0};
   double maxv[3] = {0, 0, 0};
+  float float_min = FLT_MAX, float_max = -FLT_MAX;
   uint64_t nonblack = 0;
   uint64_t count = uint64_t(dump_width_) * dump_height_;
   std::string ppm;
@@ -1123,7 +1115,13 @@ void NativeCommandProcessor::FinishFrontDump() {
   for (uint64_t i = 0; i < count; ++i) {
     float rgb[3] = {0, 0, 0};
     static const bool dump_alpha = std::getenv("SDNX_DUMP_ALPHA") != nullptr;  // alpha as grey
-    if (dump_bpp_ == 4) {
+    if (dump_float_) {
+      float f;
+      std::memcpy(&f, data + i * 4, 4);
+      float_min = std::min(float_min, f);
+      float_max = std::max(float_max, f);
+      rgb[0] = rgb[1] = rgb[2] = f;
+    } else if (dump_bpp_ == 4) {
       uint32_t v = *reinterpret_cast<const uint32_t*>(data + i * 4);
       rgb[0] = float(v & 0xFF) / 255.0f;
       rgb[1] = float((v >> 8) & 0xFF) / 255.0f;
@@ -1165,6 +1163,7 @@ void NativeCommandProcessor::FinishFrontDump() {
               dump_address_,
               dump_width_, dump_height_, avg[0], avg[1], avg[2], maxv[0], maxv[1], maxv[2],
               100.0 * double(nonblack) / double(count));
+  if (dump_float_) REXGPU_INFO("[sdnx_front] R32F range {:.6f} .. {:.6f}", float_min, float_max);
   if (write_ppm && !ppm.empty()) {
     std::filesystem::path path = rex::filesystem::GetExecutableFolder() / "front_dump.ppm";
     if (std::FILE* f = std::fopen(path.string().c_str(), "wb")) {
@@ -1189,6 +1188,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                        uint32_t frontbuffer_height) {
   (void)frontbuffer_ptr;
   ++stats_.swaps;
+  ++stats_total_swaps_;
 #if REX_PLATFORM_SWITCH
   RexSwitchPerfCount(0);
 #endif
@@ -1265,6 +1265,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
   ui::Presenter* presenter = graphics_system_->presenter();
   bool submitted = false;
+  if (front) LumaRecord(*front);
   if (presenter && front) {
     uint32_t width = std::max(frontbuffer_width, uint32_t(1));
     uint32_t height = std::max(frontbuffer_height, uint32_t(1));

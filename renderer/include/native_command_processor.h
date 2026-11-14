@@ -17,6 +17,7 @@
 
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/sdnx/flat_map.h>
+#include <rex/graphics/sdnx/gpu_backend.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
@@ -27,6 +28,8 @@ class VulkanDevice;
 }
 
 namespace rex::graphics::sdnx {
+
+class VulkanBackend;
 
 class NativeCommandProcessor : public CommandProcessor {
  public:
@@ -54,8 +57,10 @@ class NativeCommandProcessor : public CommandProcessor {
  private:
   static constexpr uint32_t kFramesInFlight = 3;
 
-  // A host image (all kept in VK_IMAGE_LAYOUT_GENERAL in this stage).
+  // A host image (all kept in VK_IMAGE_LAYOUT_GENERAL in this stage). `gpu`: made by the backend (image and view
+  // below are its handles, kept while the frontend still records Vulkan commands itself); otherwise made here.
   struct Image {
+    GpuImage* gpu = nullptr;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
@@ -85,6 +90,22 @@ class NativeCommandProcessor : public CommandProcessor {
   std::array<std::vector<Image>, kFramesInFlight> retired_images_;
   bool dummies_initialized_ = false;
   void FullBarrier(int line = __builtin_LINE(), const char* file = __builtin_FILE());
+  // SDNX_LUMA_LOG: mean brightness of each presented frame, read back when its slot completes.
+  struct LumaSlot {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapping = nullptr;
+    VkDeviceSize size = 0;
+    uint32_t width = 0, height = 0;
+    uint64_t swap = 0;
+    bool pending = false;
+  };
+  std::array<LumaSlot, kFramesInFlight> luma_slots_;
+  double luma_history_sum_ = 0.0;
+  uint32_t luma_history_count_ = 0;
+  uint64_t stats_total_swaps_ = 0;
+  void LumaRecord(const Image& front);
+  void LumaCheck(uint32_t slot);
   void AttachmentBarrier();
   void BeginPassBarrier(const VkImage* images, uint32_t count);
   // Set by every transfer (copy, blit, clear, dispatch); a full barrier clears it (see BeginPassBarrier).
@@ -109,9 +130,8 @@ class NativeCommandProcessor : public CommandProcessor {
   bool CreatePresentPipeline();
   void ReportStats();
 
-  VkCommandPool command_pool_ = VK_NULL_HANDLE;
-  std::array<VkCommandBuffer, kFramesInFlight> command_buffers_{};
-  std::array<VkFence, kFramesInFlight> fences_{};
+  // The GPU backend (gpu_backend.h): frames, barriers and render-target images so far.
+  std::unique_ptr<VulkanBackend> backend_;
   uint64_t frame_ = 0;
   bool frame_open_ = false;
   VkCommandBuffer cb_ = VK_NULL_HANDLE;
@@ -139,7 +159,7 @@ class NativeCommandProcessor : public CommandProcessor {
     std::string name;
     bool vertex = false;
     std::vector<FetchSlot> fetches;
-    VkShaderModule module = VK_NULL_HANDLE;
+    GpuShader* shader = nullptr;  // the backend's, made on first use (GetShader)
     bool load_failed = false;
     // "pull" in the index line: the shader reads its vertices itself by a computed index (hand-made instancing),
     // from the upload buffer (set 4 binding 3) with the per-fetch offset / stride / format of the shared block.
@@ -154,8 +174,8 @@ class NativeCommandProcessor : public CommandProcessor {
     std::vector<VertexFetchRuntime> fetches;
   };
   struct UploadBuffer {
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    GpuBuffer* gpu = nullptr;
+    VkBuffer buffer = VK_NULL_HANDLE;  // gpu's (the draw still binds it directly)
     uint8_t* mapping = nullptr;
     VkDeviceSize size = 0, offset = 0;
   };
@@ -178,7 +198,7 @@ class NativeCommandProcessor : public CommandProcessor {
   bool LoadLibrary();
   LibraryEntry* FindVertexShader(Shader* shader, const VertexShaderInfo*& info);
   LibraryEntry* FindPixelShader(Shader* shader);
-  VkShaderModule GetModule(LibraryEntry& entry);
+  GpuShader* GetShader(LibraryEntry& entry);
   // Bytes in the frame's upload buffer; returns the offset or UINT64_MAX when full.
   VkDeviceSize Upload(const void* data, VkDeviceSize size, VkDeviceSize alignment, uint8_t** mapping_out = nullptr);
   void EndRendering();
@@ -187,15 +207,8 @@ class NativeCommandProcessor : public CommandProcessor {
   std::unordered_map<uint64_t, LibraryEntry> library_vs_, library_ps_;
   std::unordered_map<const Shader*, VertexShaderInfo> vs_info_;
   std::array<UploadBuffer, kFramesInFlight> upload_{};
-  VkDescriptorSetLayout heap_layouts_[4] = {};  // Texture2D, Texture3D, TextureCube, samplers (sets 0-3)
-  VkDescriptorSetLayout constants_layout_ = VK_NULL_HANDLE;  // set 4: 3 dynamic UBOs
-  VkDescriptorPool draw_descriptor_pool_ = VK_NULL_HANDLE;
-  VkDescriptorSet heap_sets_[4] = {};
-  std::array<VkDescriptorSet, kFramesInFlight> constants_sets_{};
-  VkPipelineLayout draw_pipeline_layout_ = VK_NULL_HANDLE;
   Image dummy_2d_, dummy_3d_, dummy_cube_;
-  VkSampler dummy_sampler_ = VK_NULL_HANDLE;
-  std::unordered_map<uint64_t, VkPipeline> pipelines_;
+  GpuView* dummy_views_[3] = {};  // at index 0 of the image heaps, with the placeholder sampler at index 0
   // Current dynamic rendering pass.
   bool rendering_ = false;
   uint64_t rendering_key_ = 0;
@@ -222,31 +235,13 @@ class NativeCommandProcessor : public CommandProcessor {
   uint64_t TextureContentHash(const Texture& texture);
   void EvictTextures();  // every 64 frames: textures not sampled for a while (they were never freed)
   std::vector<uint8_t> texture_scratch_;  // LoadTexture: the byte-swapped guest data of one slice
-  // Graphics state already recorded in the current command buffer (it survives rendering passes, copies and
-  // clears; the present uses the compute bind point): only changes are recorded. Each vkCmdSet* costs CPU time in
-  // the driver (NVK copies and flushes its dynamic state). Reset by vkBeginCommandBuffer.
-  struct BoundState {
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    VkViewport viewport = {};
-    VkRect2D scissor = {};
-    float blend[4] = {-1.0f, -1.0f, -1.0f, -1.0f};
-    uint32_t stencil[6] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
-    float bias[2] = {-1e30f, -1e30f};
-    bool heaps = false, viewport_set = false, scissor_set = false;
-    VkBuffer index_buffer = VK_NULL_HANDLE;
-    VkDeviceSize index_offset = 0;
-    VkBuffer vertex_buffers[16] = {};
-    VkDeviceSize vertex_offsets[16] = {};
-    uint32_t vertex_count = 0;
-  } bound_;
   // Format of the view GetTextureDescriptor chose last (for the sampler: no linear filter where unsupported).
   VkFormat last_texture_format_ = VK_FORMAT_UNDEFINED;
-  std::unordered_map<int, bool> filterable_formats_;
   bool FormatFilterable(VkFormat format);
   // Copies the resolved images of the faces of a cube texture into it; true if the cube comes from resolves.
   bool OverlayResolvedFaces(Texture& texture, const xenos::xe_gpu_texture_fetch_t& fetch);
   struct TextureView {
-    VkImageView view = VK_NULL_HANDLE;
+    GpuView* view = nullptr;
     uint32_t heap = 0, index = 0;  // heap 0 2D, 1 3D, 2 cube
   };
   void InitializeTextures();
@@ -303,7 +298,7 @@ class NativeCommandProcessor : public CommandProcessor {
   std::vector<uint32_t> free_indices_[3];
   uint32_t next_index_[3] = {1, 1, 1};
   std::unordered_map<uint64_t, uint32_t> samplers_;  // key -> sampler heap index
-  std::vector<VkSampler> sampler_objects_;
+  uint32_t sampler_count_ = 0;  // samplers written to the heap after the placeholder (index 0)
   std::unique_ptr<std::atomic<uint32_t>[]> page_versions_;
   void* write_watch_handle_ = nullptr;
   std::unordered_map<uint32_t, uint32_t> unsupported_formats_;
@@ -340,8 +335,7 @@ class NativeCommandProcessor : public CommandProcessor {
     bool dynamic = false;
     uint64_t hot_until = 0;  // refused for hot pages: no page scan again before this frame (content hash path)
   };
-  VkBuffer geometry_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory geometry_memory_ = VK_NULL_HANDLE;
+  GpuBuffer* geometry_gpu_ = nullptr;  // device-local, only with SDNX_GEOCACHE
   std::map<VkDeviceSize, VkDeviceSize> geometry_free_;  // offset -> size
   std::array<std::vector<std::pair<VkDeviceSize, VkDeviceSize>>, kFramesInFlight> geometry_retired_;
   std::unordered_map<uint64_t, GeometryEntry> geometry_;
@@ -370,8 +364,7 @@ class NativeCommandProcessor : public CommandProcessor {
     uint64_t hashed_frame = UINT64_MAX;  // last frame its content was hashed (and matched or was filled)
     uint64_t content_since = 0;          // frame the current content was filled
   };
-  VkBuffer hashed_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory hashed_memory_ = VK_NULL_HANDLE;
+  GpuBuffer* hashed_gpu_ = nullptr;
   uint8_t* hashed_mapping_ = nullptr;
   std::map<VkDeviceSize, VkDeviceSize> hashed_free_;
   std::array<std::vector<std::pair<VkDeviceSize, VkDeviceSize>>, kFramesInFlight> hashed_retired_;
@@ -433,6 +426,7 @@ class NativeCommandProcessor : public CommandProcessor {
   void* dump_mapping_ = nullptr;
   VkDeviceSize dump_size_ = 0;
   uint32_t dump_width_ = 0, dump_height_ = 0, dump_bpp_ = 0;
+  bool dump_float_ = false;  // R32_SFLOAT (depth resolves): the value as grey, its range in the log
   uint32_t front_address_ = 0, dump_address_ = 0;
   Image* last_color_rt_ = nullptr;  // diagnostic: the colour target of the last draw
   int dump_remaining_ = 0;

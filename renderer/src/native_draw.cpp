@@ -10,6 +10,8 @@
  */
 #include <rex/graphics/sdnx/native_command_processor.h>
 
+#include "vulkan_backend.h"
+
 #include <algorithm>
 #include <cfloat>
 #include <cstdlib>
@@ -221,7 +223,8 @@ void AnalyzeVertexShader(const std::vector<uint32_t>& w, uint64_t& masked_key,
 bool NativeCommandProcessor::LoadLibrary() {
   std::filesystem::path dir;
   const char* env = std::getenv("SDNX_SHADERS");
-  dir = (env && *env) ? std::filesystem::path(env) : rex::filesystem::GetExecutableFolder() / "sdnx_shaders";
+  dir = (env && *env) ? std::filesystem::path(env)
+                       : rex::filesystem::GetExecutableFolder() / backend_->ShaderPackage();
   std::ifstream index(dir / "index.txt");
   if (!index) {
     REXGPU_ERROR("[sdnx_native] shader package not found: {}", (dir / "index.txt").string());
@@ -233,7 +236,7 @@ bool NativeCommandProcessor::LoadLibrary() {
     std::string kind, key_hex, name;
     if (!(ls >> kind >> key_hex >> name)) continue;
     LibraryEntry entry;
-    entry.name = (dir / (name + ".spv")).string();
+    entry.name = (dir / (name + backend_->ShaderExtension())).string();
     entry.vertex = kind == "vs";
     std::string slot;
     while (ls >> slot) {
@@ -254,25 +257,23 @@ bool NativeCommandProcessor::LoadLibrary() {
   return true;
 }
 
-VkShaderModule NativeCommandProcessor::GetModule(LibraryEntry& entry) {
-  if (entry.module || entry.load_failed) return entry.module;
+GpuShader* NativeCommandProcessor::GetShader(LibraryEntry& entry) {
+  if (entry.shader || entry.load_failed) return entry.shader;
   std::ifstream f(entry.name, std::ios::binary);
-  std::vector<uint32_t> code;
+  std::vector<uint8_t> code;
   if (f) {
     f.seekg(0, std::ios::end);
-    size_t size = size_t(f.tellg());
+    code.resize(size_t(f.tellg()));
     f.seekg(0);
-    code.resize(size / 4);
-    f.read(reinterpret_cast<char*>(code.data()), std::streamsize(code.size() * 4));
+    f.read(reinterpret_cast<char*>(code.data()), std::streamsize(code.size()));
   }
-  if (!code.empty()) {
-    entry.module = ui::vulkan::util::CreateShaderModule(vulkan_device(), code.data(), code.size() * 4);
-  }
-  if (!entry.module) {
+  const std::string base = std::filesystem::path(entry.name).stem().string();
+  if (code.empty() || !backend_->CreateShader(entry.shader, entry.vertex, code.data(), code.size(), base.c_str())) {
+    entry.shader = nullptr;
     entry.load_failed = true;
     REXGPU_ERROR("[sdnx_native] could not load {}", entry.name);
   }
-  return entry.module;
+  return entry.shader;
 }
 
 NativeCommandProcessor::LibraryEntry* NativeCommandProcessor::FindVertexShader(Shader* shader,
@@ -306,168 +307,43 @@ bool NativeCommandProcessor::InitializeDraws() {
   LoadLibrary();
 
   for (UploadBuffer& upload : upload_) {
-    uint32_t memory_type;
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            device, kUploadBufferSize,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            ui::vulkan::util::MemoryPurpose::kUpload, upload.buffer, upload.memory, &memory_type)) {
-      return false;
-    }
-    void* mapping = nullptr;
-    dfn.vkMapMemory(vk, upload.memory, 0, VK_WHOLE_SIZE, 0, &mapping);
-    upload.mapping = static_cast<uint8_t*>(mapping);
+    upload.gpu = backend_->CreateBuffer(kUploadBufferSize, BufferUsage::kUpload, &upload.mapping);
+    if (!upload.gpu) return false;
+    upload.buffer = upload.gpu->buffer;
     upload.size = kUploadBufferSize;
   }
 
-  // Sets 0-3: bindless heaps, set 4: constants.
-  VkDescriptorType heap_types[4] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER};
-  for (int i = 0; i < 4; ++i) {
-    VkDescriptorSetLayoutBinding binding = {0, heap_types[i], kHeapSize,
-                                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-    // Textures and samplers are added while command buffers that use the heaps are recording or pending.
-    VkDescriptorBindingFlags flags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
-                                     VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
-                                     VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
-    VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info = {};
-    flags_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
-    flags_info.bindingCount = 1;
-    flags_info.pBindingFlags = &flags;
-    VkDescriptorSetLayoutCreateInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    info.pNext = &flags_info;
-    info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
-    info.bindingCount = 1;
-    info.pBindings = &binding;
-    if (dfn.vkCreateDescriptorSetLayout(vk, &info, nullptr, &heap_layouts_[i]) != VK_SUCCESS) return false;
-  }
-  {
-    // Binding 3: the whole upload buffer of the frame, read by the vertex shaders that pull their vertices.
-    VkDescriptorSetLayoutBinding bindings[4] = {
-        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-         nullptr},
-        {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-         nullptr},
-        {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-         nullptr},
-        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr}};
-    VkDescriptorSetLayoutCreateInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    info.bindingCount = 4;
-    info.pBindings = bindings;
-    if (dfn.vkCreateDescriptorSetLayout(vk, &info, nullptr, &constants_layout_) != VK_SUCCESS) return false;
-  }
-  {
-    VkDescriptorSetLayout layouts[5] = {heap_layouts_[0], heap_layouts_[1], heap_layouts_[2], heap_layouts_[3],
-                                        constants_layout_};
-    VkPushConstantRange push = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 24};
-    VkPipelineLayoutCreateInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    info.setLayoutCount = 5;
-    info.pSetLayouts = layouts;
-    info.pushConstantRangeCount = 1;
-    info.pPushConstantRanges = &push;
-    if (dfn.vkCreatePipelineLayout(vk, &info, nullptr, &draw_pipeline_layout_) != VK_SUCCESS) return false;
-  }
-  {
-    VkDescriptorPoolSize sizes[4] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kHeapSize * 3},
-                                     {VK_DESCRIPTOR_TYPE_SAMPLER, kHeapSize},
-                                     {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3 * kFramesInFlight},
-                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kFramesInFlight}};
-    VkDescriptorPoolCreateInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    info.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
-    info.maxSets = 4 + kFramesInFlight;
-    info.poolSizeCount = 4;
-    info.pPoolSizes = sizes;
-    if (dfn.vkCreateDescriptorPool(vk, &info, nullptr, &draw_descriptor_pool_) != VK_SUCCESS) return false;
-    VkDescriptorSetAllocateInfo alloc = {};
-    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc.descriptorPool = draw_descriptor_pool_;
-    alloc.descriptorSetCount = 4;
-    alloc.pSetLayouts = heap_layouts_;
-    if (dfn.vkAllocateDescriptorSets(vk, &alloc, heap_sets_) != VK_SUCCESS) return false;
-    std::array<VkDescriptorSetLayout, kFramesInFlight> layouts;
-    layouts.fill(constants_layout_);
-    alloc.descriptorSetCount = kFramesInFlight;
-    alloc.pSetLayouts = layouts.data();
-    if (dfn.vkAllocateDescriptorSets(vk, &alloc, constants_sets_.data()) != VK_SUCCESS) return false;
-    for (uint32_t f = 0; f < kFramesInFlight; ++f) {
-      VkDeviceSize storage_range =
-          std::min<VkDeviceSize>(kUploadBufferSize, device->properties().maxStorageBufferRange);
-      VkDescriptorBufferInfo buffers[4] = {{upload_[f].buffer, 0, 4096},
-                                           {upload_[f].buffer, 0, 224 * 16},
-                                           {upload_[f].buffer, 0, kSharedBlockSize},
-                                           {upload_[f].buffer, 0, storage_range}};
-      VkWriteDescriptorSet writes[4] = {};
-      for (uint32_t b = 0; b < 4; ++b) {
-        writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[b].dstSet = constants_sets_[f];
-        writes[b].dstBinding = b;
-        writes[b].descriptorCount = 1;
-        writes[b].descriptorType = b == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-        writes[b].pBufferInfo = &buffers[b];
-      }
-      dfn.vkUpdateDescriptorSets(vk, 4, writes, 0, nullptr);
-      pull_range_ = storage_range;
-    }
-  }
+  // Descriptor sets, pipeline layout and pipelines are the backend's. Storage buffer 3 (the pulled vertices) covers
+  // this much of an upload ring.
+  pull_range_ = std::min<VkDeviceSize>(kUploadBufferSize, backend_->MaxStorageBufferRange());
 
-  // Placeholder textures (white) and sampler at index 0 of the heaps.
-  auto make_dummy = [&](Image& image, VkImageType type, VkImageViewType view_type, uint32_t layers,
-                        VkImageCreateFlags flags) -> bool {
-    VkImageCreateInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    info.flags = flags;
-    info.imageType = type;
-    info.format = VK_FORMAT_R8G8B8A8_UNORM;
-    info.extent = {1, 1, 1};
-    info.mipLevels = 1;
-    info.arrayLayers = layers;
-    info.samples = VK_SAMPLE_COUNT_1_BIT;
-    info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (!ui::vulkan::util::CreateDedicatedAllocationImage(device, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
-                                                          image.image, image.memory))
-      return false;
-    VkImageViewCreateInfo view = {};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = image.image;
-    view.viewType = view_type;
-    view.format = info.format;
-    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
-    if (dfn.vkCreateImageView(vk, &view, nullptr, &image.view) != VK_SUCCESS) return false;
-    image.format = info.format;
+  // Placeholder textures (white, 1x1) at index 0 of the image heaps and the placeholder sampler at index 0.
+  const ImageType dummy_types[3] = {ImageType::k2D, ImageType::k3D, ImageType::kCube};
+  Image* dummies[3] = {&dummy_2d_, &dummy_3d_, &dummy_cube_};
+  for (int i = 0; i < 3; ++i) {
+    ImageDesc desc;
+    desc.type = dummy_types[i];
+    desc.format = VK_FORMAT_R8G8B8A8_UNORM;
+    desc.layers = dummy_types[i] == ImageType::kCube ? 6 : 1;
+    Image& image = *dummies[i];
+    image.gpu = backend_->CreateImage(desc);
+    if (!image.gpu) return false;
+    image.image = image.gpu->image;
+    image.view = image.gpu->view;
+    image.format = desc.format;
     image.width = image.height = 1;
-    return true;
-  };
-  if (!make_dummy(dummy_2d_, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 1, 0) ||
-      !make_dummy(dummy_3d_, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D, 1, 0) ||
-      !make_dummy(dummy_cube_, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_CUBE, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)) {
-    return false;
+    ViewDesc view;
+    view.type = desc.type;
+    view.format = desc.format;
+    view.layers = desc.layers;
+    dummy_views_[i] = backend_->CreateView(image.gpu, view);
+    if (!dummy_views_[i]) return false;
+    backend_->WriteImageDescriptor(desc.type, 0, dummy_views_[i]);
   }
   {
-    VkSamplerCreateInfo sampler = {};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.maxLod = 16.0f;
-    if (dfn.vkCreateSampler(vk, &sampler, nullptr, &dummy_sampler_) != VK_SUCCESS) return false;
-    VkDescriptorImageInfo images[4] = {{VK_NULL_HANDLE, dummy_2d_.view, VK_IMAGE_LAYOUT_GENERAL},
-                                       {VK_NULL_HANDLE, dummy_3d_.view, VK_IMAGE_LAYOUT_GENERAL},
-                                       {VK_NULL_HANDLE, dummy_cube_.view, VK_IMAGE_LAYOUT_GENERAL},
-                                       {dummy_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED}};
-    VkWriteDescriptorSet writes[4] = {};
-    for (int i = 0; i < 4; ++i) {
-      writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      writes[i].dstSet = heap_sets_[i];
-      writes[i].descriptorCount = 1;
-      writes[i].descriptorType = heap_types[i];
-      writes[i].pImageInfo = &images[i];
-    }
-    dfn.vkUpdateDescriptorSets(vk, 4, writes, 0, nullptr);
+    SamplerDesc sampler;
+    sampler.mag_linear = sampler.min_linear = true;
+    backend_->WriteSamplerDescriptor(0, sampler);
   }
   InitializeTextures();
   if (!InitializeGeometry()) {
@@ -486,27 +362,19 @@ void NativeCommandProcessor::ShutdownDraws() {
   const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
   VkDevice vk = device->device();
   ShutdownTextures();
-  for (auto& it : pipelines_) dfn.vkDestroyPipeline(vk, it.second, nullptr);
-  pipelines_.clear();
   for (auto* lib : {&library_vs_, &library_ps_}) {
-    for (auto& it : *lib) {
-      if (it.second.module) dfn.vkDestroyShaderModule(vk, it.second.module, nullptr);
-    }
+    for (auto& it : *lib) backend_->DestroyShader(it.second.shader);
     lib->clear();
+  }
+  for (GpuView*& view : dummy_views_) {
+    backend_->DestroyView(view);
+    view = nullptr;
   }
   DestroyImage(dummy_2d_);
   DestroyImage(dummy_3d_);
   DestroyImage(dummy_cube_);
-  if (dummy_sampler_) dfn.vkDestroySampler(vk, dummy_sampler_, nullptr);
-  if (draw_descriptor_pool_) dfn.vkDestroyDescriptorPool(vk, draw_descriptor_pool_, nullptr);
-  if (draw_pipeline_layout_) dfn.vkDestroyPipelineLayout(vk, draw_pipeline_layout_, nullptr);
-  if (constants_layout_) dfn.vkDestroyDescriptorSetLayout(vk, constants_layout_, nullptr);
-  for (auto& layout : heap_layouts_) {
-    if (layout) dfn.vkDestroyDescriptorSetLayout(vk, layout, nullptr);
-  }
   for (UploadBuffer& upload : upload_) {
-    if (upload.buffer) dfn.vkDestroyBuffer(vk, upload.buffer, nullptr);
-    if (upload.memory) dfn.vkFreeMemory(vk, upload.memory, nullptr);
+    backend_->DestroyBuffer(upload.gpu);
     upload = UploadBuffer();
   }
 }
@@ -528,7 +396,7 @@ VkDeviceSize NativeCommandProcessor::Upload(const void* data, VkDeviceSize size,
 void NativeCommandProcessor::EndRendering() {
   if (!rendering_) return;
   EndHostQuery();  // occlusion queries cannot cross rendering pass instances
-  vulkan_device()->functions().vkCmdEndRendering(cb_);
+  backend_->EndRendering();
   rendering_ = false;
   rendering_key_ = 0;
 }
@@ -574,7 +442,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   if (!vs || !index_count) return true;
   const VertexShaderInfo* vs_info = nullptr;
   LibraryEntry* vs_entry = FindVertexShader(vs, vs_info);
-  if (!vs_entry || !GetModule(*vs_entry)) {
+  if (!vs_entry || !GetShader(*vs_entry)) {
     ++stats_.missing_vs;
     static const bool trace_vs = std::getenv("SDNX_TRACE_VS") != nullptr;
     static int traced = 0;
@@ -616,7 +484,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
         }
       }
     }
-    if (!ps_entry || !GetModule(*ps_entry)) {
+    if (!ps_entry || !GetShader(*ps_entry)) {
       ++stats_.missing_ps;
       static const bool trace_ps = std::getenv("SDNX_TRACE_PS") != nullptr;
       static int traced_ps = 0;
@@ -896,7 +764,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
       extra_first = std::max(extra_first, (vb_size[b] + bindings[b].stride - 1) / bindings[b].stride);
     }
   }
-  VkBuffer vb_buffers[16];
+  GpuBuffer* vb_buffers[16];
   VkDeviceSize vb_offsets[16];
   uint8_t* vb_data[16] = {};
   // Vertex buffers that are not cached are copied only in the range of vertices the draw uses (found from the
@@ -1045,7 +913,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
         copy_vertices(out, src, size, endian);
       });
       if (cached != UINT64_MAX) {
-        vb_buffers[b] = geometry_buffer_;
+        vb_buffers[b] = geometry_gpu_;
         vb_offsets[b] = cached;
         vb_cached[b] = true;
         continue;
@@ -1072,7 +940,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
                                   [&](uint8_t* out) { copy_vertices(out, src + begin, part, endian); });
             }
             if (hashed) {
-              vb_buffers[b] = hashed_buffer_;
+              vb_buffers[b] = hashed_gpu_;
               vb_offsets[b] = hashed->offset;
               continue;
             }
@@ -1085,7 +953,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
           }
           copy_vertices(part_dst, src + begin, part, endian);
           stats_.geo_direct_bytes += part;
-          vb_buffers[b] = upload.buffer;
+          vb_buffers[b] = upload.gpu;
           vb_offsets[b] = part_offset;
           continue;
         }
@@ -1099,7 +967,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
       return true;
     }
     copy_vertices(dst, src, size, fetch.endian);
-    vb_buffers[b] = upload.buffer;
+    vb_buffers[b] = upload.gpu;
     vb_offsets[b] = offset;
     vb_data[b] = dst;
     vb_cached[b] = true;  // whole buffer from vertex 0, like a cached one
@@ -1208,13 +1076,13 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   }
   std::vector<uint32_t> indices;
   bool indexed = index_buffer_info && index_buffer_info->guest_base;
-  VkBuffer index_buffer = upload.buffer;
+  GpuBuffer* index_buffer = upload.gpu;
   VkDeviceSize index_offset = 0;
   uint32_t index_draw_count = 0;
   bool index_cached = false;
   // Already found through the content-hashed copies (for the vertex range): use that copy.
   if (indexed && !rect_count && index_hash_tried && index_hashed) {
-    index_buffer = hashed_buffer_;
+    index_buffer = hashed_gpu_;
     index_offset = index_hashed->offset;
     index_draw_count = quads ? index_count / 4 * 6 : index_count;
     index_cached = true;
@@ -1259,12 +1127,12 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
             }
           });
       if (cached != UINT64_MAX) {
-        index_buffer = geometry_buffer_;
+        index_buffer = geometry_gpu_;
         index_offset = cached;
         index_draw_count = host_count;
         index_cached = true;
       } else if (HashedGeometry* hashed = index_hashed_lookup()) {
-        index_buffer = hashed_buffer_;
+        index_buffer = hashed_gpu_;
         index_offset = hashed->offset;
         index_draw_count = host_count;
         index_cached = true;
@@ -1334,7 +1202,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
 
   prof_mark(3);
   // Constants: VS c0-c255, PS c256-c479, shared block.
-  VkDeviceSize ubo_align = std::max<VkDeviceSize>(device->properties().minUniformBufferOffsetAlignment, 16);
+  VkDeviceSize ubo_align = backend_->ConstantAlignment();
   // The bound ranges stay 4096 / 3584 bytes, but only the registers up to the last one the shader reads are copied
   // (whole 8.6 KB per draw was ~40 MB of memcpy a frame on the console). Dynamic addressing: everything.
   auto used_constant_bytes = [](Shader* shader, uint32_t registers) -> uint32_t {
@@ -1342,7 +1210,9 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     static string::StringBuffer constants_disassembly;
     if (!shader->is_ucode_analyzed()) shader->AnalyzeUcode(constants_disassembly);
     const Shader::ConstantRegisterMap& map = shader->constant_register_map();
-    if (map.float_dynamic_addressing) return registers * 16;
+    // SDNX_FULL_CONSTANTS=1: diagnostic, every register copied (the analysis may miss what a shader reads).
+    static const bool full_constants = std::getenv("SDNX_FULL_CONSTANTS") != nullptr;
+    if (map.float_dynamic_addressing || full_constants) return registers * 16;
     for (int w = int(registers / 64) - 1 + int(registers % 64 != 0); w >= 0; --w) {
       uint64_t bits = map.float_bitmap[w];
       if (w == int(registers / 64) && registers % 64) bits &= (uint64_t(1) << (registers % 64)) - 1;
@@ -1403,6 +1273,13 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   }
   for (uint32_t k = 0; k < 32; ++k) shared[(624 / 4) + k / 2] |= swizzle_codes[k] << ((k & 1) * 16);
   if (pull) std::memcpy(&shared[kPullInfoOffset / 4], pull_info, sizeof(pull_info));
+  uint32_t spec = kSpecConstantsUbo;
+  if (color_control.alpha_test_enable && ps_entry) {
+    spec |= kSpecAlphaTest | (uint32_t(color_control.alpha_func) << 16);
+  }
+  // Byte 616 (free between _InvSize and g_FetchSwizzle): the pipeline's specialization value, which the deko3d
+  // shaders read instead of a specialization constant (shader_common.h, SDNX_DK_SPEC_OFFSET).
+  shared[616 / 4] = spec;
   BindTextures(vs, ps_entry ? ps : nullptr, shared);
   VkDeviceSize shared_constants = upload_reused(shared_copy, shared, sizeof(shared), sizeof(shared));
   if (vs_constants == UINT64_MAX || ps_constants == UINT64_MAX || shared_constants == UINT64_MAX) {
@@ -1411,54 +1288,40 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   }
 
   prof_mark(4);
-  // Pipeline.
-  uint32_t spec = kSpecConstantsUbo;
-  if (color_control.alpha_test_enable && ps_entry) {
-    spec |= kSpecAlphaTest | (uint32_t(color_control.alpha_func) << 16);
-  }
-  struct PipelineKey {
-    uint64_t vs, ps;
-    uint32_t topology, restart, spec, attribute_count, binding_count;
-    uint32_t attr[16][4];
-    uint32_t bind[16];
-    uint32_t color_formats[4], depth_format, color_count;
-    uint32_t blend[4], color_mask;
-    uint32_t depth_test, depth_write, depth_func;
-    uint32_t stencil;  // RB_DEPTHCONTROL stencil bits (0 when disabled)
-    uint32_t cull;     // bit 0 front, bit 1 back, bit 2 front face clockwise
-  } key = {};
-  key.vs = reinterpret_cast<uintptr_t>(vs_entry);
-  key.ps = reinterpret_cast<uintptr_t>(ps_entry);
-  key.topology = topology;
-  key.restart = restart;
-  key.spec = spec;
-  key.attribute_count = attribute_count;
-  key.binding_count = binding_count;
+  // The draw for the backend: fixed state (a pipeline on Vulkan), then dynamic state and buffers below.
+  DrawPacket packet;
+  packet.vs = vs_entry->shader;
+  packet.ps = ps_entry ? ps_entry->shader : nullptr;
+  packet.spec = spec;
+  packet.attribute_count = attribute_count;
+  packet.binding_count = binding_count;
   for (uint32_t a = 0; a < attribute_count; ++a) {
-    key.attr[a][0] = attributes[a].location;
-    key.attr[a][1] = attributes[a].binding;
-    key.attr[a][2] = attributes[a].format;
-    key.attr[a][3] = attributes[a].offset;
+    packet.attributes[a] = {attributes[a].location, attributes[a].binding, attributes[a].format, attributes[a].offset};
   }
-  for (uint32_t b = 0; b < binding_count; ++b) key.bind[b] = bindings[b].stride;
-  key.color_count = color_count;
+  for (uint32_t b = 0; b < binding_count; ++b) packet.strides[b] = bindings[b].stride;
+  packet.topology = topology;
+  packet.primitive_restart = restart;
+  packet.color_count = color_count;
   for (uint32_t i = 0; i < color_count; ++i) {
-    key.color_formats[i] = colors[i] ? colors[i]->format : VK_FORMAT_UNDEFINED;
-    key.blend[i] = regs[reg::RB_BLENDCONTROL::rt_register_indices[i]];
+    packet.colors[i] = colors[i] ? colors[i]->gpu : nullptr;
+    packet.blend_control[i] = regs[reg::RB_BLENDCONTROL::rt_register_indices[i]];
   }
-  key.color_mask = color_mask;
-  key.depth_format = depth ? depth->format : VK_FORMAT_UNDEFINED;
-  key.depth_test = depth && depth_control.z_enable;
-  key.depth_write = depth && depth_control.z_write_enable;
-  key.depth_func = uint32_t(depth_control.zfunc);
+  packet.color_mask = color_mask;
+  packet.depth = depth ? depth->gpu : nullptr;
+  packet.depth_test = depth && depth_control.z_enable;
+  packet.depth_write = depth && depth_control.z_write_enable;
+  packet.depth_func = VkCompareOp(uint32_t(depth_control.zfunc));
   {
     // As the SDK Vulkan backend: the host mapping is GetHostViewportInfo's (see the NDC note above), where the
     // guest face bit means clockwise. Rectangle lists are expanded here, their winding is not the guest's.
     auto mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
     static const bool no_cull = std::getenv("SDNX_NO_CULL") != nullptr;
     if (!no_cull && draw_util::IsPrimitivePolygonal(regs) && prim_type != xenos::PrimitiveType::kRectangleList) {
-      key.cull = uint32_t(mode_cntl.cull_front) | uint32_t(mode_cntl.cull_back) << 1 |
+      packet.cull = uint32_t(mode_cntl.cull_front) | uint32_t(mode_cntl.cull_back) << 1 |
                  uint32_t(mode_cntl.face != 0) << 2;
+      // SDNX_FLIP_FACE1=1: diagnostic, the front face of the draws with the face bit set (light volumes) inverted.
+      static const bool flip_face1 = std::getenv("SDNX_FLIP_FACE1") != nullptr;
+      if (flip_face1 && mode_cntl.face != 0) packet.cull &= ~4u;
     }
   }
   static const bool no_stencil = std::getenv("SDNX_NO_STENCIL") != nullptr;
@@ -1468,149 +1331,12 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
       no_stencil || (no_stencil_ps && ps_entry && ps_entry->name.find(no_stencil_ps) != std::string::npos);
   if (depth && depth_control.stencil_enable && !skip_stencil) {
     // Bits 0 and 7-31: enable, backface enable, front and back functions and operations.
-    key.stencil = depth_control.value & 0xFFFFFF81u;
-    if (!depth_control.backface_enable) key.stencil &= 0x0001FFFFu;
+    packet.stencil = depth_control.value & 0xFFFFFF81u;
+    if (!depth_control.backface_enable) packet.stencil &= 0x000FFFFFu;  // the front fields (zfail is bits 17-19)
   }
-  uint64_t pipeline_hash = XXH3_64bits(&key, sizeof(key));
-  VkPipeline& pipeline = pipelines_[pipeline_hash];
   if (tr) {
-    REXGPU_INFO("[sdnx_trace] draw {}: shaders ok, attrs={} binds={} colors={} depth={} pipeline={:#x}", trace_index,
-                attribute_count, binding_count, color_count, depth != nullptr, pipeline_hash);
-  }
-  if (!pipeline) {
-    if (tr) {
-      REXGPU_INFO("[sdnx_trace] draw {}: creating pipeline vs={} ps={} spec={:#x}", trace_index, vs_entry->name,
-                  ps_entry ? ps_entry->name : "-", spec);
-    }
-    ++stats_.new_pipelines;
-    VkSpecializationMapEntry spec_entry = {0, 0, 4};
-    VkSpecializationInfo spec_info = {1, &spec_entry, 4, &spec};
-    VkPipelineShaderStageCreateInfo stages[2] = {};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vs_entry->module;
-    stages[0].pName = "main";
-    stages[0].pSpecializationInfo = &spec_info;
-    stages[1] = stages[0];
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = ps_entry ? ps_entry->module : VK_NULL_HANDLE;
-    VkVertexInputAttributeDescription vk_attributes[16];
-    VkVertexInputBindingDescription vk_bindings[16];
-    for (uint32_t a = 0; a < attribute_count; ++a) {
-      vk_attributes[a] = {attributes[a].location, attributes[a].binding, attributes[a].format, attributes[a].offset};
-    }
-    for (uint32_t b = 0; b < binding_count; ++b) {
-      vk_bindings[b] = {b, bindings[b].stride, VK_VERTEX_INPUT_RATE_VERTEX};
-    }
-    VkPipelineVertexInputStateCreateInfo vertex_input = {};
-    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertex_input.vertexBindingDescriptionCount = binding_count;
-    vertex_input.pVertexBindingDescriptions = vk_bindings;
-    vertex_input.vertexAttributeDescriptionCount = attribute_count;
-    vertex_input.pVertexAttributeDescriptions = vk_attributes;
-    VkPipelineInputAssemblyStateCreateInfo input_assembly = {};
-    input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    input_assembly.topology = topology;
-    input_assembly.primitiveRestartEnable = restart;
-    VkPipelineViewportStateCreateInfo viewport_state = {};
-    viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport_state.viewportCount = 1;
-    viewport_state.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo raster = {};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = ((key.cull & 1) ? VK_CULL_MODE_FRONT_BIT : 0) | ((key.cull & 2) ? VK_CULL_MODE_BACK_BIT : 0);
-    raster.frontFace = (key.cull & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    raster.depthBiasEnable = depth ? VK_TRUE : VK_FALSE;  // the factors are dynamic (zero for most draws)
-    raster.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo multisample = {};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo depth_stencil = {};
-    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth_stencil.depthTestEnable = key.depth_test;
-    depth_stencil.depthWriteEnable = key.depth_write;
-    depth_stencil.depthCompareOp = VkCompareOp(key.depth_func);
-    if (key.stencil) {
-      // Xenos CompareFunction and StencilOp have the Vulkan values. Reference and masks are dynamic.
-      reg::RB_DEPTHCONTROL dc;
-      dc.value = key.stencil;
-      depth_stencil.stencilTestEnable = VK_TRUE;
-      depth_stencil.front.compareOp = VkCompareOp(dc.stencilfunc);
-      depth_stencil.front.failOp = VkStencilOp(dc.stencilfail);
-      depth_stencil.front.passOp = VkStencilOp(dc.stencilzpass);
-      depth_stencil.front.depthFailOp = VkStencilOp(dc.stencilzfail);
-      if (dc.backface_enable) {
-        depth_stencil.back.compareOp = VkCompareOp(dc.stencilfunc_bf);
-        depth_stencil.back.failOp = VkStencilOp(dc.stencilfail_bf);
-        depth_stencil.back.passOp = VkStencilOp(dc.stencilzpass_bf);
-        depth_stencil.back.depthFailOp = VkStencilOp(dc.stencilzfail_bf);
-      } else {
-        depth_stencil.back = depth_stencil.front;
-      }
-    }
-    VkPipelineColorBlendAttachmentState blend[4] = {};
-    for (uint32_t i = 0; i < color_count; ++i) {
-      reg::RB_BLENDCONTROL bc;
-      bc.value = key.blend[i];
-      blend[i].colorWriteMask = (color_mask >> (4 * i)) & 0xF;
-      blend[i].srcColorBlendFactor = BlendFactor(bc.color_srcblend);
-      blend[i].dstColorBlendFactor = BlendFactor(bc.color_destblend);
-      blend[i].colorBlendOp = BlendOp(bc.color_comb_fcn);
-      blend[i].srcAlphaBlendFactor = BlendFactor(bc.alpha_srcblend);
-      blend[i].dstAlphaBlendFactor = BlendFactor(bc.alpha_destblend);
-      blend[i].alphaBlendOp = BlendOp(bc.alpha_comb_fcn);
-      blend[i].blendEnable = !(blend[i].srcColorBlendFactor == VK_BLEND_FACTOR_ONE &&
-                               blend[i].dstColorBlendFactor == VK_BLEND_FACTOR_ZERO &&
-                               blend[i].colorBlendOp == VK_BLEND_OP_ADD &&
-                               blend[i].srcAlphaBlendFactor == VK_BLEND_FACTOR_ONE &&
-                               blend[i].dstAlphaBlendFactor == VK_BLEND_FACTOR_ZERO &&
-                               blend[i].alphaBlendOp == VK_BLEND_OP_ADD);
-      if (!colors[i]) blend[i].colorWriteMask = 0;
-    }
-    VkPipelineColorBlendStateCreateInfo color_blend = {};
-    color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    color_blend.attachmentCount = color_count;
-    color_blend.pAttachments = blend;
-    VkDynamicState dynamic_states[7] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                        VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
-                                        VK_DYNAMIC_STATE_DEPTH_BIAS};
-    VkPipelineDynamicStateCreateInfo dynamic = {};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 7;
-    dynamic.pDynamicStates = dynamic_states;
-    VkFormat color_formats[4];
-    for (uint32_t i = 0; i < color_count; ++i) color_formats[i] = VkFormat(key.color_formats[i]);
-    VkPipelineRenderingCreateInfo rendering = {};
-    rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    rendering.colorAttachmentCount = color_count;
-    rendering.pColorAttachmentFormats = color_formats;
-    rendering.depthAttachmentFormat = depth ? depth->format : VK_FORMAT_UNDEFINED;
-    rendering.stencilAttachmentFormat = depth ? depth->format : VK_FORMAT_UNDEFINED;
-    VkGraphicsPipelineCreateInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    info.pNext = &rendering;
-    info.stageCount = ps_entry ? 2 : 1;
-    info.pStages = stages;
-    info.pVertexInputState = &vertex_input;
-    info.pInputAssemblyState = &input_assembly;
-    info.pViewportState = &viewport_state;
-    info.pRasterizationState = &raster;
-    info.pMultisampleState = &multisample;
-    info.pDepthStencilState = &depth_stencil;
-    info.pColorBlendState = &color_blend;
-    info.pDynamicState = &dynamic;
-    info.layout = draw_pipeline_layout_;
-    if (dfn.vkCreateGraphicsPipelines(device->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) !=
-        VK_SUCCESS) {
-      pipeline = VK_NULL_HANDLE;
-      pipelines_.erase(pipeline_hash);
-      REXGPU_ERROR("[sdnx_native] pipeline creation failed (vs {}, ps {})", vs_entry->name,
-                   ps_entry ? ps_entry->name : "-");
-      ++stats_.skipped;
-      return true;
-    }
+    REXGPU_INFO("[sdnx_trace] draw {}: shaders ok, attrs={} binds={} colors={} depth={} spec={:#x}", trace_index,
+                attribute_count, binding_count, color_count, depth != nullptr, spec);
   }
 
   if (log_frame_) {
@@ -1633,17 +1359,21 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
                         shared[48 + s]);
       }
     }
-    REXGPU_INFO("[sdnx_frame] viewport {},{} {}x{} ndc scale {:.4f},{:.4f} offset {:.4f},{:.4f} area {}x{} "
-                "vte {:#x} window_offset {:#x}",
+    REXGPU_INFO("[sdnx_frame] viewport {},{} {}x{} ndc scale {:.4f},{:.4f},{:.4f} offset {:.4f},{:.4f},{:.4f} z {:.4f}-{:.4f} "
+                "zscale {} zoffset {} area {}x{} vte {:#x} window_offset {:#x}",
                 viewport.xy_offset[0], viewport.xy_offset[1], viewport.xy_extent[0], viewport.xy_extent[1],
-                viewport.ndc_scale[0], viewport.ndc_scale[1], viewport.ndc_offset[0], viewport.ndc_offset[1], area_w,
+                viewport.ndc_scale[0], viewport.ndc_scale[1], viewport.ndc_scale[2], viewport.ndc_offset[0],
+                viewport.ndc_offset[1], viewport.ndc_offset[2], viewport.z_min, viewport.z_max,
+                regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE), regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET), area_w,
                 area_h, regs[XE_GPU_REG_PA_CL_VTE_CNTL], regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET]);
     REXGPU_INFO("[sdnx_frame] draw {} prim={} n={} rt base={} fmt={} pitch={} mask={:#x} blend={:#x} depthctl={:#x} "
-                "stencil={:#x} scissor={},{} {}x{} depth_img={:#x} {}x{} msaa={} binds={} rects={} vs={} ps={}{}",
+                "stencil={:#x} cull={} mode_cntl={:#x} scissor={},{} {}x{} depth_base={} depth_img={:#x} {}x{} msaa={} binds={} rects={} vs={} ps={}{}",
                 log_draw_, uint32_t(prim_type), index_count, base0, fmt0, pitch, color_mask,
                 regs[reg::RB_BLENDCONTROL::rt_register_indices[0]], depth_control.value,
-                regs[XE_GPU_REG_RB_STENCILREFMASK], scissor.offset[0], scissor.offset[1], scissor.extent[0],
-                scissor.extent[1], uint64_t(reinterpret_cast<uintptr_t>(depth ? depth->image : 0)),
+                regs[XE_GPU_REG_RB_STENCILREFMASK], packet.cull, regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], scissor.offset[0],
+                scissor.offset[1], scissor.extent[0],
+                scissor.extent[1], uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base),
+                uint64_t(reinterpret_cast<uintptr_t>(depth ? depth->image : 0)),
                 depth ? depth->width : 0, depth ? depth->height : 0, uint32_t(surface.msaa_samples), binding_count,
                 rect_count, vs_entry->name.substr(vs_entry->name.find_last_of("/\\") + 1),
                 ps_entry ? ps_entry->name.substr(ps_entry->name.find_last_of("/\\") + 1) : "-", textures);
@@ -1667,9 +1397,8 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
       // In double and clamped: z 1 in float rounds 0xFFFFFF + 0.5 up to 2^24, which overflowed the word to 0.
       uint32_t depth24 = std::min(uint32_t(double(z) * double(0xFFFFFF) + 0.5), uint32_t(0xFFFFFF));
       uint32_t word = (depth24 << 8) | (ref.stencilref & 0xFF);
-      VkClearAttachment clear = {};
-      clear.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      for (int i = 0; i < 4; ++i) clear.clearValue.color.float32[i] = float((word >> (8 * i)) & 0xFF) / 255.0f;
+      float clear_rgba[4];
+      for (int i = 0; i < 4; ++i) clear_rgba[i] = float((word >> (8 * i)) & 0xFF) / 255.0f;
       uint32_t depth_base = regs.Get<reg::RB_DEPTH_INFO>().depth_base;
       uint64_t base_pitch = uint64_t(depth_base & 0xFFF) | (uint64_t((pitch << msaa_sx) & 0xFFFF) << 12);
       int32_t x0 = std::max(int32_t(rect_bounds[0] + 0.5f), int32_t(scissor.offset[0])) << msaa_sx;
@@ -1685,22 +1414,8 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
         if (x0 < 0 || y0 < 0 || cx1 <= x0 || cy1 <= y0) continue;
         EndRendering();
         FullBarrier();
-        VkRenderingAttachmentInfo color_info = {};
-        color_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        color_info.imageView = target.view;
-        color_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        color_info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        color_info.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        VkRenderingInfo rendering_info = {};
-        rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        rendering_info.renderArea = {{0, 0}, {target.width, target.height}};
-        rendering_info.layerCount = 1;
-        rendering_info.colorAttachmentCount = 1;
-        rendering_info.pColorAttachments = &color_info;
-        dfn.vkCmdBeginRendering(cb_, &rendering_info);
-        VkClearRect rect = {{{x0, y0}, {uint32_t(cx1 - x0), uint32_t(cy1 - y0)}}, 0, 1};
-        dfn.vkCmdClearAttachments(cb_, 1, &clear, 1, &rect);
-        dfn.vkCmdEndRendering(cb_);
+        backend_->ClearAttachmentRect(target.gpu, VkRect2D{{x0, y0}, {uint32_t(cx1 - x0), uint32_t(cy1 - y0)}},
+                                      clear_rgba);
         attachments_written_.push_back(target.image);  // written as an attachment (see BeginPassBarrier)
         target.drawn = true;
         ++stats_.clears;
@@ -1713,7 +1428,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   }
   // Record.
   if (tr) {
-    REXGPU_INFO("[sdnx_trace] draw {}: pipeline ready, begin recording", trace_index);
+    REXGPU_INFO("[sdnx_trace] draw {}: state ready, begin recording", trace_index);
   }
   for (uint32_t i = 0; i < color_count; ++i) {
     if (colors[i]) colors[i]->drawn = true;
@@ -1728,73 +1443,28 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
       pass_images[4] = depth ? depth->image : VK_NULL_HANDLE;
       BeginPassBarrier(pass_images, 5);
     }
-    VkRenderingAttachmentInfo color_infos[4] = {};
-    for (uint32_t i = 0; i < color_count; ++i) {
-      color_infos[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-      color_infos[i].imageView = colors[i] ? colors[i]->view : VK_NULL_HANDLE;
-      color_infos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-      color_infos[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-      color_infos[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    }
-    VkRenderingAttachmentInfo depth_info = {};
-    depth_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depth_info.imageView = depth ? depth->view : VK_NULL_HANDLE;
-    depth_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    depth_info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    depth_info.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    VkRenderingInfo rendering_info = {};
-    rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering_info.renderArea = {{0, 0}, {area_w, area_h}};
-    rendering_info.layerCount = 1;
-    rendering_info.colorAttachmentCount = color_count;
-    rendering_info.pColorAttachments = color_infos;
-    rendering_info.pDepthAttachment = depth ? &depth_info : nullptr;
-    rendering_info.pStencilAttachment = depth ? &depth_info : nullptr;
-    dfn.vkCmdBeginRendering(cb_, &rendering_info);
+    backend_->BeginRendering(packet.colors, color_count, packet.depth, area_w, area_h);
     rendering_ = true;
     rendering_key_ = rendering_key;
     BeginHostQuery();  // continues an open guest occlusion query in this pass
   }
-  // Only what changed since the previous draw of this command buffer (bound_).
-  if (bound_.pipeline != pipeline) {
-    dfn.vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    bound_.pipeline = pipeline;
-  }
-  VkViewport vk_viewport = {float(viewport.xy_offset[0]), float(viewport.xy_offset[1]), float(viewport.xy_extent[0]),
-                            float(viewport.xy_extent[1]), viewport.z_min, viewport.z_max};
-  if (!bound_.viewport_set || std::memcmp(&bound_.viewport, &vk_viewport, sizeof(vk_viewport))) {
-    dfn.vkCmdSetViewport(cb_, 0, 1, &vk_viewport);
-    bound_.viewport = vk_viewport;
-    bound_.viewport_set = true;
-  }
+  packet.viewport = {float(viewport.xy_offset[0]), float(viewport.xy_offset[1]), float(viewport.xy_extent[0]),
+                     float(viewport.xy_extent[1]), viewport.z_min, viewport.z_max};
   uint32_t sx = std::min(scissor.offset[0] << msaa_sx, area_w), sy = std::min(scissor.offset[1] << msaa_sy, area_h);
-  VkRect2D vk_scissor = {{int32_t(sx), int32_t(sy)},
-                         {std::min(scissor.extent[0] << msaa_sx, area_w - sx),
-                          std::min(scissor.extent[1] << msaa_sy, area_h - sy)}};
-  if (!bound_.scissor_set || std::memcmp(&bound_.scissor, &vk_scissor, sizeof(vk_scissor))) {
-    dfn.vkCmdSetScissor(cb_, 0, 1, &vk_scissor);
-    bound_.scissor = vk_scissor;
-    bound_.scissor_set = true;
-  }
-  float blend_constants[4] = {regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
-                              regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)};
-  if (std::memcmp(bound_.blend, blend_constants, sizeof(blend_constants))) {
-    dfn.vkCmdSetBlendConstants(cb_, blend_constants);
-    std::memcpy(bound_.blend, blend_constants, sizeof(blend_constants));
-  }
+  packet.scissor = {{int32_t(sx), int32_t(sy)},
+                    {std::min(scissor.extent[0] << msaa_sx, area_w - sx),
+                     std::min(scissor.extent[1] << msaa_sy, area_h - sy)}};
+  packet.blend_constants[0] = regs.Get<float>(XE_GPU_REG_RB_BLEND_RED);
+  packet.blend_constants[1] = regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN);
+  packet.blend_constants[2] = regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE);
+  packet.blend_constants[3] = regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
   {
     auto front = regs.Get<reg::RB_STENCILREFMASK>();
     reg::RB_STENCILREFMASK back = front;
     if (depth_control.backface_enable) back.value = regs[XE_GPU_REG_RB_STENCILREFMASK_BF];
     const uint32_t stencil[6] = {front.stencilref,  back.stencilref,       front.stencilmask,
                                  back.stencilmask,  front.stencilwritemask, back.stencilwritemask};
-    if (stencil[0] != bound_.stencil[0]) dfn.vkCmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_BIT, stencil[0]);
-    if (stencil[1] != bound_.stencil[1]) dfn.vkCmdSetStencilReference(cb_, VK_STENCIL_FACE_BACK_BIT, stencil[1]);
-    if (stencil[2] != bound_.stencil[2]) dfn.vkCmdSetStencilCompareMask(cb_, VK_STENCIL_FACE_FRONT_BIT, stencil[2]);
-    if (stencil[3] != bound_.stencil[3]) dfn.vkCmdSetStencilCompareMask(cb_, VK_STENCIL_FACE_BACK_BIT, stencil[3]);
-    if (stencil[4] != bound_.stencil[4]) dfn.vkCmdSetStencilWriteMask(cb_, VK_STENCIL_FACE_FRONT_BIT, stencil[4]);
-    if (stencil[5] != bound_.stencil[5]) dfn.vkCmdSetStencilWriteMask(cb_, VK_STENCIL_FACE_BACK_BIT, stencil[5]);
-    std::memcpy(bound_.stencil, stencil, sizeof(stencil));
+    std::memcpy(packet.stencil_values, stencil, sizeof(stencil));
   }
   if (depth) {
     // Polygon offset, as the SDK Vulkan backend (host render target path).
@@ -1804,66 +1474,38 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
                          ? draw_util::kD3D10PolygonOffsetFactorUnorm24
                          : draw_util::kD3D10PolygonOffsetFactorFloat24;
     bias_slope *= xenos::kPolygonOffsetScaleSubpixelUnit * float(1u << std::max(msaa_sx, msaa_sy));
-    if (bias_constant != bound_.bias[0] || bias_slope != bound_.bias[1]) {
-      dfn.vkCmdSetDepthBias(cb_, bias_constant, 0.0f, bias_slope);
-      bound_.bias[0] = bias_constant;
-      bound_.bias[1] = bias_slope;
+    // SDNX_DEPTH_BIAS_SCALE=f: diagnostic, both factors scaled (0 = no polygon offset).
+    static const float bias_scale =
+        std::getenv("SDNX_DEPTH_BIAS_SCALE") ? float(std::atof(std::getenv("SDNX_DEPTH_BIAS_SCALE"))) : 1.0f;
+    bias_constant *= bias_scale;
+    bias_slope *= bias_scale;
+    if (log_frame_ && (bias_constant != 0.0f || bias_slope != 0.0f)) {
+      REXGPU_INFO("[sdnx_frame] draw {} depth bias constant {} slope {} (depth format {})", log_draw_, bias_constant,
+                  bias_slope, uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format));
     }
+    packet.depth_bias_constant = bias_constant;
+    packet.depth_bias_slope = bias_slope;
   }
-  if (tr) {
-    REXGPU_INFO("[sdnx_trace] draw {}: binding descriptors (heaps + constants)", trace_index);
-  }
-  if (!bound_.heaps) {
-    // The bindless heaps never change within a command buffer.
-    dfn.vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, draw_pipeline_layout_, 0, 4, heap_sets_, 0,
-                                nullptr);
-    bound_.heaps = true;
-  }
-  uint32_t dynamic_offsets[3] = {uint32_t(vs_constants), uint32_t(ps_constants), uint32_t(shared_constants)};
-  VkDescriptorSet constants_set = constants_sets_[uint32_t(frame_ % kFramesInFlight)];
-  // Same offsets as the previous draw of this command buffer (reused constants): the set stays bound.
-  static VkCommandBuffer constants_cb = VK_NULL_HANDLE;
-  static uint64_t constants_frame = UINT64_MAX;
-  static uint32_t constants_offsets[3] = {};
-  if (constants_cb != cb_ || constants_frame != frame_ || std::memcmp(constants_offsets, dynamic_offsets, 12) != 0) {
-    dfn.vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, draw_pipeline_layout_, 4, 1, &constants_set, 3,
-                                dynamic_offsets);
-    constants_cb = cb_;
-    constants_frame = frame_;
-    std::memcpy(constants_offsets, dynamic_offsets, 12);
-  } else {
-    ++stats_.constants_bind_skipped;
-  }
-  if (binding_count) {
-    // Rebind from the first binding that differs.
-    uint32_t first = 0;
-    while (first < binding_count && first < bound_.vertex_count && bound_.vertex_buffers[first] == vb_buffers[first] &&
-           bound_.vertex_offsets[first] == vb_offsets[first]) {
-      ++first;
-    }
-    if (first < binding_count) {
-      dfn.vkCmdBindVertexBuffers(cb_, first, binding_count - first, vb_buffers + first, vb_offsets + first);
-    }
-    for (uint32_t b = 0; b < binding_count; ++b) {
-      bound_.vertex_buffers[b] = vb_buffers[b];
-      bound_.vertex_offsets[b] = vb_offsets[b];
-    }
-    bound_.vertex_count = std::max(bound_.vertex_count, binding_count);
-  }
+  packet.constants[0] = {upload.gpu, vs_constants};
+  packet.constants[1] = {upload.gpu, ps_constants};
+  packet.constants[2] = {upload.gpu, shared_constants};
+  packet.constant_sizes[0] = 4096;
+  packet.constant_sizes[1] = 224 * 16;
+  packet.constant_sizes[2] = kSharedBlockSize;
+  packet.shared = shared;
+  for (uint32_t b = 0; b < binding_count; ++b) packet.vertex_buffers[b] = {vb_buffers[b], vb_offsets[b]};
+  packet.index_buffer = {index_buffer, index_offset};
+  packet.index_count = index_draw_count;
+  packet.vertex_offset = vertex_offset;
+  packet.vertex_count = index_count;
   if (tr) {
     REXGPU_INFO("[sdnx_trace] draw {}: issuing {} {}", trace_index,
-                index_draw_count ? index_draw_count : index_count, index_draw_count ? "cmdDrawIndexed" : "cmdDraw");
+                index_draw_count ? index_draw_count : index_count, index_draw_count ? "indexed" : "non-indexed");
     ++trace_index;
   }
-  if (index_draw_count) {
-    if (bound_.index_buffer != index_buffer || bound_.index_offset != index_offset) {
-      dfn.vkCmdBindIndexBuffer(cb_, index_buffer, index_offset, VK_INDEX_TYPE_UINT32);
-      bound_.index_buffer = index_buffer;
-      bound_.index_offset = index_offset;
-    }
-    dfn.vkCmdDrawIndexed(cb_, index_draw_count, 1, 0, vertex_offset, 0);
-  } else {
-    dfn.vkCmdDraw(cb_, index_count, 1, 0, 0);
+  if (!backend_->Draw(packet)) {
+    ++stats_.skipped;
+    return true;
   }
   ++stats_.drawn;
   if (prof) {

@@ -11,6 +11,16 @@
 !/nx/
 /nx/*
 !/nx/sdretail/
+!/nx/deko3d/
+!/nx/dktest/
+/nx/dktest/build/
+/nx/dktest/shaderbuild/
+/nx/dktest/*.map
+/nx/dktest/*.lst
+/nx/dktest/romfs/
+/nx/dktest/*.nro
+/nx/dktest/*.elf
+/nx/dktest/*.nacp
 !/nx/shaders/
 !/nx/tools/
 !/nx/desktop/
@@ -32,6 +42,7 @@
 !/port/tools/compile_internal_vs.sh
 !/port/tools/debug_composite.py
 !/port/tools/debug_composite_run.ps1
+!/port/tools/debug_shadow.py
 !/port/tools/export_renderer.ps1
 !/port/tools/extract_iso.py
 !/port/tools/fps_bench.ps1

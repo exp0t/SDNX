@@ -11,6 +11,8 @@
  */
 #include <rex/graphics/sdnx/native_command_processor.h>
 
+#include "vulkan_backend.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -219,23 +221,19 @@ void NativeCommandProcessor::InitializeTextures() {
 }
 
 void NativeCommandProcessor::ShutdownTextures() {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  VkDevice vk = device->device();
   if (write_watch_handle_) {
     memory_->UnregisterPhysicalMemoryInvalidationCallback(write_watch_handle_);
     write_watch_handle_ = nullptr;
   }
   for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) ReleaseRetiredViews(slot);
-  for (auto& it : views_) dfn.vkDestroyImageView(vk, it.second.view, nullptr);
+  for (auto& it : views_) backend_->DestroyView(it.second.view);
   views_.clear();
   image_views_.clear();
   for (auto& it : textures_) DestroyImage(it.second.image);
   textures_.clear();
   for (auto& it : resolved_copies_) DestroyImage(it.second.image);
   resolved_copies_.clear();
-  for (VkSampler sampler : sampler_objects_) dfn.vkDestroySampler(vk, sampler, nullptr);
-  sampler_objects_.clear();
+  sampler_count_ = 0;  // the samplers themselves are the backend's
   samplers_.clear();
 }
 
@@ -307,40 +305,28 @@ uint32_t NativeCommandProcessor::GetView(const Image& image, uint32_t heap, uint
     }
     return 0;
   }
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  VkImageViewCreateInfo info = {};
-  info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-  info.image = image.image;
-  info.viewType = heap == 2 ? VK_IMAGE_VIEW_TYPE_CUBE : (heap == 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D);
-  info.format = view_format;
-  VkComponentSwizzle* components[4] = {&info.components.r, &info.components.g, &info.components.b,
-                                       &info.components.a};
+  ViewDesc desc;
+  desc.type = heap == 2 ? ImageType::kCube : (heap == 1 ? ImageType::k3D : ImageType::k2D);
+  desc.format = view_format;
+  desc.levels = levels;
+  desc.layers = layers;
   for (uint32_t i = 0; i < 4; ++i) {
     uint32_t guest = (swizzle >> (3 * i)) & 7;
     if (guest < 4) {
-      *components[i] = VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R + ((host_swizzle >> (3 * guest)) & 3));
+      desc.swizzle[i] = VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R + ((host_swizzle >> (3 * guest)) & 3));
     } else {
-      *components[i] = guest == 5 ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
+      desc.swizzle[i] = guest == 5 ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
     }
   }
-  info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, heap == 2 ? 6u : std::min(layers, 1u)};
   TextureView view;
   view.heap = heap;
   view.index = index;
-  if (dfn.vkCreateImageView(device->device(), &info, nullptr, &view.view) != VK_SUCCESS) {
+  view.view = backend_->CreateView(image.gpu, desc);
+  if (!view.view) {
     free_indices_[heap].push_back(index);
     return 0;
   }
-  VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, view.view, VK_IMAGE_LAYOUT_GENERAL};
-  VkWriteDescriptorSet write = {};
-  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  write.dstSet = heap_sets_[heap];
-  write.dstArrayElement = index;
-  write.descriptorCount = 1;
-  write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-  write.pImageInfo = &image_info;
-  dfn.vkUpdateDescriptorSets(device->device(), 1, &write, 0, nullptr);
+  backend_->WriteImageDescriptor(desc.type, index, view.view);
   views_.emplace(key, view);
   image_views_[image.image].push_back(key);
   return index;
@@ -360,9 +346,8 @@ void NativeCommandProcessor::RetireViews(VkImage image) {
 }
 
 void NativeCommandProcessor::ReleaseRetiredViews(uint32_t slot) {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
   for (const TextureView& view : retired_views_[slot]) {
-    device->functions().vkDestroyImageView(device->device(), view.view, nullptr);
+    backend_->DestroyView(view.view);
     free_indices_[view.heap].push_back(view.index);
   }
   retired_views_[slot].clear();
@@ -371,20 +356,7 @@ void NativeCommandProcessor::ReleaseRetiredViews(uint32_t slot) {
 // ---------------------------------------------------------------------------------------------------------------
 // Samplers.
 
-bool NativeCommandProcessor::FormatFilterable(VkFormat format) {
-  auto it = filterable_formats_.find(format);
-  if (it != filterable_formats_.end()) return it->second;
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  VkFormatProperties properties = {};
-  device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(device->physical_device(), format,
-                                                                             &properties);
-  bool filterable = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
-  if (!filterable) {
-    REXGPU_WARN("[sdnx_native] format {} cannot be sampled with linear filtering here: point sampling it", int(format));
-  }
-  filterable_formats_[format] = filterable;
-  return filterable;
-}
+bool NativeCommandProcessor::FormatFilterable(VkFormat format) { return backend_->FormatFilterable(format); }
 
 uint32_t NativeCommandProcessor::GetSamplerDescriptor(const xenos::xe_gpu_texture_fetch_t& fetch,
                                                       const ParsedTextureFetchInstruction& instr) {
@@ -415,39 +387,24 @@ uint32_t NativeCommandProcessor::GetSamplerDescriptor(const xenos::xe_gpu_textur
                 uint32_t(min), uint32_t(mip), uint32_t(fetch.clamp_x), uint32_t(fetch.clamp_y),
                 uint32_t(fetch.clamp_z), uint32_t(fetch.border_color), bias);
   }
-  if (sampler_objects_.size() + 1 >= kHeapSize) return 0;
+  if (sampler_count_ + 1 >= kHeapSize) return 0;
 
-  VkSamplerCreateInfo info = {};
-  info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-  info.magFilter = mag == TextureFilter::kLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-  info.minFilter = min == TextureFilter::kLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-  info.mipmapMode = mip == TextureFilter::kLinear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-  info.addressModeU = AddressMode(fetch.clamp_x);
-  info.addressModeV = AddressMode(fetch.clamp_y);
-  info.addressModeW = AddressMode(fetch.clamp_z);
-  info.mipLodBias = float(bias) / 32.0f;
-  info.minLod = 0.0f;
-  info.maxLod = mip == TextureFilter::kBaseMap ? 0.25f : VK_LOD_CLAMP_NONE;
+  SamplerDesc desc;
+  desc.mag_linear = mag == TextureFilter::kLinear;
+  desc.min_linear = min == TextureFilter::kLinear;
+  desc.mip_linear = mip == TextureFilter::kLinear;
+  desc.base_map_only = mip == TextureFilter::kBaseMap;
+  desc.address[0] = AddressMode(fetch.clamp_x);
+  desc.address[1] = AddressMode(fetch.clamp_y);
+  desc.address[2] = AddressMode(fetch.clamp_z);
+  desc.lod_bias = float(bias) / 32.0f;
   switch (uint32_t(fetch.border_color)) {
-    case 0: info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK; break;
-    case 1: info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; break;
-    default: info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; break;
+    case 0: desc.border = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK; break;
+    case 1: desc.border = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; break;
+    default: desc.border = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; break;
   }
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  VkSampler sampler;
-  if (dfn.vkCreateSampler(device->device(), &info, nullptr, &sampler) != VK_SUCCESS) return 0;
-  sampler_objects_.push_back(sampler);
-  uint32_t index = uint32_t(sampler_objects_.size());  // 0 is the placeholder sampler
-  VkDescriptorImageInfo image_info = {sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-  VkWriteDescriptorSet write = {};
-  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  write.dstSet = heap_sets_[3];
-  write.dstArrayElement = index;
-  write.descriptorCount = 1;
-  write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-  write.pImageInfo = &image_info;
-  dfn.vkUpdateDescriptorSets(device->device(), 1, &write, 0, nullptr);
+  uint32_t index = ++sampler_count_;  // 0 is the placeholder sampler
+  backend_->WriteSamplerDescriptor(index, desc);
   samplers_.emplace(key, index);
   return index;
 }
@@ -513,7 +470,12 @@ bool NativeCommandProcessor::LoadTexture(Texture& texture, const xenos::xe_gpu_t
   VkDeviceSize staging = Upload(nullptr, total, 16, &dst);
   if (staging == UINT64_MAX) return false;  // the frame's upload buffer is full: next frame
 
-  std::vector<VkBufferImageCopy> regions;
+  struct UploadRegion {
+    uint64_t offset;
+    uint32_t row_length, image_height;
+    ImageRegion to;
+  };
+  std::vector<UploadRegion> regions;
   std::vector<uint8_t>& swapped = texture_scratch_;  // reused: no allocation and zero fill per load
   VkDeviceSize offset = 0;
   uint32_t packed = layout.packed_level;
@@ -618,14 +580,17 @@ bool NativeCommandProcessor::LoadTexture(Texture& texture, const xenos::xe_gpu_t
       } else if (host.convert != Convert::kNone) {
         Convert16(out, size, host.convert);
       }
-      VkBufferImageCopy region = {};
-      region.bufferOffset = staging + offset;
-      region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
-      region.imageExtent = {lw, lh, ld};
+      UploadRegion region = {};
+      region.offset = staging + offset;
+      region.to.level = level;
+      region.to.layer = layer;
+      region.to.width = lw;
+      region.to.height = lh;
+      region.to.depth = ld;
       if (ctx1) {
         // Decoded in whole blocks: rows of lbw * 4 texels, lbh * 4 rows.
-        region.bufferRowLength = lbw * bw;
-        region.bufferImageHeight = lbh * bh;
+        region.row_length = lbw * bw;
+        region.image_height = lbh * bh;
       }
       regions.push_back(region);
       offset += size;
@@ -633,8 +598,6 @@ bool NativeCommandProcessor::LoadTexture(Texture& texture, const xenos::xe_gpu_t
   }
 
   // The host image (recreated when the size or format changes).
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
   Image& image = texture.image;
   if (image.image &&
       (image.format != host.format || image.width != width || image.height != height || texture.levels != levels ||
@@ -643,48 +606,41 @@ bool NativeCommandProcessor::LoadTexture(Texture& texture, const xenos::xe_gpu_t
   }
   EndRendering();
   if (!image.image) {
-    VkImageCreateInfo create = {};
-    create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    create.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+    ImageDesc desc;
+    desc.type = cube ? ImageType::kCube : (is_3d ? ImageType::k3D : ImageType::k2D);
+    desc.format = host.format;
+    desc.width = width;
+    desc.height = height;
+    desc.depth = depth;
+    desc.levels = levels;
+    desc.layers = layers;
     // Signed fetch constants read the same bits through an SNORM view.
-    if (SignedFormat(host.format)) create.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-    create.imageType = is_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-    create.format = host.format;
-    create.extent = {width, height, depth};
-    create.mipLevels = levels;
-    create.arrayLayers = layers;
-    create.samples = VK_SAMPLE_COUNT_1_BIT;
-    create.tiling = VK_IMAGE_TILING_OPTIMAL;
-    create.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (!ui::vulkan::util::CreateDedicatedAllocationImage(device, create, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
-                                                          image.image, image.memory)) {
+    desc.mutable_format = SignedFormat(host.format) != VK_FORMAT_UNDEFINED;
+    image.gpu = backend_->CreateImage(desc);
+    if (!image.gpu) {
       texture.failed = true;
       REXGPU_ERROR("[sdnx_native] could not create a {}x{} texture (format {})", width, height, uint32_t(format));
       return false;
     }
+    image.image = image.gpu->image;
+    image.view = image.gpu->view;
+    image.aspect = image.gpu->aspect;
     image.format = host.format;
     image.width = width;
     image.height = height;
     texture.levels = levels;
     texture.layers = layers;
     texture.depth = depth;
-    VkImageMemoryBarrier barrier = {};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image.image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers};
-    dfn.vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                             nullptr, 1, &barrier);
+    backend_->InitializeImage(image.gpu, desc, false);  // every level and layer is uploaded next
     image.initialized = true;
   }
   // Earlier draws (also of frames still in flight - same queue) may sample the old contents.
   FullBarrier();
-  dfn.vkCmdCopyBufferToImage(cb_, upload_[uint32_t(frame_ % kFramesInFlight)].buffer, image.image,
-                             VK_IMAGE_LAYOUT_GENERAL, uint32_t(regions.size()), regions.data());
+  GpuBuffer* upload_buffer = upload_[uint32_t(frame_ % kFramesInFlight)].gpu;
+  for (const UploadRegion& region : regions) {
+    backend_->CopyBufferToImage({upload_buffer, region.offset}, region.row_length, region.image_height, image.gpu,
+                                region.to, Aspect::kColor);
+  }
   transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   FullBarrier();
   if (is_3d) {
@@ -758,12 +714,11 @@ bool NativeCommandProcessor::OverlayResolvedFaces(Texture& texture, const xenos:
   FullBarrier();
   for (uint32_t f = 0; f < 6; ++f) {
     if (!faces[f]) continue;
-    VkImageCopy region = {};
-    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, f, 1};
-    region.extent = {width, height, 1};
-    vulkan_device()->functions().vkCmdCopyImage(cb_, faces[f]->image, VK_IMAGE_LAYOUT_GENERAL, texture.image.image,
-                                                VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    ImageRegion from, to;
+    from.width = to.width = width;
+    from.height = to.height = height;
+    to.layer = f;
+    backend_->CopyImage(faces[f]->gpu, from, texture.image.gpu, to, Aspect::kColor);
     transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   }
   FullBarrier();
@@ -794,13 +749,16 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
     ++stats_.tex_resolved;
     static const bool trace_resolve = std::getenv("SDNX_TRACE_RESOLVE") != nullptr;
     static std::unordered_map<uint64_t, int> traced;
-    uint64_t trace_key = uint64_t(base_page) | uint64_t(fetch.format) << 20 | uint64_t(uint32_t(fetch.exp_adjust) & 63) << 26;
+    uint64_t trace_key = uint64_t(base_page) | uint64_t(fetch.format) << 20 | uint64_t(uint32_t(fetch.exp_adjust) & 63) << 26 |
+                         uint64_t(fetch.swizzle) << 32;
     if (trace_resolve && traced[trace_key]++ == 0) {
+      auto swap_trace = resolved_swap_.find(base_page << kPageSizeLog2);
       REXGPU_INFO("[sdnx_resolve] sampled {:#x} as format {} {}x{} exp_adjust={} signs={}{}{}{} swizzle={:#x} "
-                  "num_format={} (image {}x{} host {})",
+                  "num_format={} swap={} ps={} (image {}x{} host {})",
                   base_page << kPageSizeLog2, uint32_t(fetch.format), width_minus_1 + 1, height_minus_1 + 1,
                   int32_t(fetch.exp_adjust), uint32_t(fetch.sign_x), uint32_t(fetch.sign_y), uint32_t(fetch.sign_z),
                   uint32_t(fetch.sign_w), uint32_t(fetch.swizzle), uint32_t(fetch.num_format),
+                  swap_trace != resolved_swap_.end() && swap_trace->second ? 1 : 0, fetch_constant,
                   resolved->second.width, resolved->second.height, int(resolved->second.format));
     }
     const Image* source = &resolved->second;
@@ -866,14 +824,12 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
         for (const ResolvedPart& part : copy.parts) {
           auto part_it = resolved_.find(part.address);
           if (part_it == resolved_.end() || !part_it->second.image) continue;
-          VkImageCopy region = {};
-          region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-          region.dstSubresource = region.srcSubresource;
-          region.dstOffset = {int32_t(part.x), int32_t(part.y), 0};
-          region.extent = {std::min(tw - part.x, part_it->second.width), std::min(th - part.y, part_it->second.height),
-                           1};
-          vulkan_device()->functions().vkCmdCopyImage(cb_, part_it->second.image, VK_IMAGE_LAYOUT_GENERAL,
-                                                      copy.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+          ImageRegion from, to;
+          from.width = to.width = std::min(tw - part.x, part_it->second.width);
+          from.height = to.height = std::min(th - part.y, part_it->second.height);
+          to.x = int32_t(part.x);
+          to.y = int32_t(part.y);
+          backend_->CopyImage(part_it->second.gpu, from, copy.image.gpu, to, Aspect::kColor);
           transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
         }
         // No barrier after the copies: the draw that samples this image begins a new rendering pass, and

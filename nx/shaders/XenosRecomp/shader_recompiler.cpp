@@ -380,6 +380,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     printDstSwizzle(instr.dstSwizzle, false);
 
     out += " = ";
+    // SDNX: the function name goes into SDNX_TEX(name, slot, ...) (shader_common.h), which is the plain call on
+    // Vulkan and picks the slot's own texture and sampler on deko3d.
+    std::string fetchName;
     switch (instr.opcode)
     {
     case FetchOpcode::TextureFetch:
@@ -389,12 +392,12 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
             out += "1.0 - ";
     #endif
 
-        out += "tfetch";
+        fetchName = "tfetch";
         break;
     }
     case FetchOpcode::GetTextureWeights:
     {
-        out += "getWeights";
+        fetchName = "getWeights";
         break;
     }
     }
@@ -422,14 +425,15 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
         break;
     }
 
-    out += dimension;
+    fetchName += dimension;
 
 #ifdef UNLEASHED_RECOMP
     if (bicubic)
-        out += "Bicubic";
+        fetchName += "Bicubic";
 #endif
 
-    print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
+    print("SDNX_TEX({2}, {3}, {0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension,
+          fetchName, instr.constIndex);
     printSrcRegister(componentCount);
 
     switch (instr.dimension)
@@ -475,6 +479,13 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     };
 
     std::string scalarOperandOverrides[7];
+    // SDNX: the components a vector source is printed for are the ones the destination is printed for. An export
+    // written by both the vector and the scalar op gets constants in the overlapping components (see the zero / one
+    // masks below), so the vector part writes vectorWriteMask & ~scalarWriteMask there; the sources were compacted
+    // with the full mask, and HLSL took the first components of the wider expression: "oC0.zw = r0.yyyz * r0.xxxx"
+    // put r0.y in w (the shadow / AO blur ps_7267a55fe94e4c23 wrote AO over the shadow mask, 2026-11-14).
+    const uint32_t vectorOperandMask =
+        instr.exportData ? (instr.vectorWriteMask & ~instr.scalarWriteMask) : instr.vectorWriteMask;
     auto op = [&](size_t operand)
         {
             if (!scalarOperandOverrides[operand].empty())
@@ -589,7 +600,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                     if (literalFloat4.count(reg))
                         regFormatted = fmt::format("c{}", reg);
                     else
-                        regFormatted = fmt::format("(MASSEFFECT_UBO ? g_Ubo{0}.v[{1}] : vk::RawBufferLoad<float4>(g_PushConstants.{0}ShaderConstants + {2}, 0x10))",
+                        regFormatted = fmt::format("(MASSEFFECT_UBO ? g_Ubo{0}.v[{1}] : SDNX_RAW_LOAD<float4>(g_PushConstants.{0}ShaderConstants + {2}, 0x10))",
                             isPixelShader ? "Pixel" : "Vertex", reg, reg * 16);
                 }
             }
@@ -629,7 +640,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                     break;
 
                 default:
-                    mask = instr.vectorWriteMask != 0 ? instr.vectorWriteMask : 0b1;
+                    mask = vectorOperandMask != 0 ? vectorOperandMask : 0b1;
                     break;
                 }
 
@@ -1454,13 +1465,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
 
                 // MASSEFFECT: dynamic UBO or pointer, depending on SPEC_CONSTANT_CONSTANTS_UBO.
-                println("#define {}(INDEX) select((INDEX) < {}, (MASSEFFECT_UBO ? g_Ubo{}.v[{} + min(INDEX, {})] : vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10)), 0.0)",
+                println("#define {}(INDEX) select((INDEX) < {}, (MASSEFFECT_UBO ? g_Ubo{}.v[{} + min(INDEX, {})] : SDNX_RAW_LOAD<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10)), 0.0)",
                     constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1,
                     shaderName, constantInfo->registerIndex.get(), tailCount - 1);
             }
             else
             {
-                println("#define {} (MASSEFFECT_UBO ? g_Ubo{}.v[{}] : vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10))",
+                println("#define {} (MASSEFFECT_UBO ? g_Ubo{}.v[{}] : SDNX_RAW_LOAD<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10))",
                     constantName, shaderName, constantInfo->registerIndex.get(), shaderName, constantInfo->registerIndex * 16);
             }
             
@@ -1484,18 +1495,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             const char* samplerName = reg == 0 ? constantName : fallbackName;
             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
             {
-                println("#define {}_Texture{}DescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
+                println("#define {}_Texture{}DescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : SDNX_RAW_LOAD<uint>(g_PushConstants.SharedConstants + {}))",
                     samplerName, TEXTURE_DIMENSIONS[j], j * 64 + registerIndex * 4, j * 64 + registerIndex * 4);
             }
 
-            println("#define {}_SamplerDescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
+            println("#define {}_SamplerDescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : SDNX_RAW_LOAD<uint>(g_PushConstants.SharedConstants + {}))",
                 samplerName, std::size(TEXTURE_DIMENSIONS) * 64 + registerIndex * 4, std::size(TEXTURE_DIMENSIONS) * 64 + registerIndex * 4);
 
             // 1/size of the host image of that slot, which the renderer writes at byte
             // 360 + slot * 8 of the shared constants (right after g_InputRemap).
             {
                 const uint32_t invBase = 360 + registerIndex * 8;
-                println("#define {}_InvSize (MASSEFFECT_UBO ? float2(MASSEFFECT_SHARED_FLOAT({}), MASSEFFECT_SHARED_FLOAT({})) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + {}))",
+                println("#define {}_InvSize (MASSEFFECT_UBO ? float2(MASSEFFECT_SHARED_FLOAT({}), MASSEFFECT_SHARED_FLOAT({})) : SDNX_RAW_LOAD<float2>(g_PushConstants.SharedConstants + {}))",
                     samplerName, invBase, invBase + 4, invBase);
             }
 
@@ -1514,11 +1525,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     {
         println("#ifndef s{}_SamplerDescriptorIndex", reg);
         for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
-            println("#define s{}_Texture{}DescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
+            println("#define s{}_Texture{}DescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : SDNX_RAW_LOAD<uint>(g_PushConstants.SharedConstants + {}))",
                 reg, TEXTURE_DIMENSIONS[j], j * 64 + reg * 4, j * 64 + reg * 4);
-        println("#define s{}_SamplerDescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
+        println("#define s{}_SamplerDescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : SDNX_RAW_LOAD<uint>(g_PushConstants.SharedConstants + {}))",
             reg, std::size(TEXTURE_DIMENSIONS) * 64 + reg * 4, std::size(TEXTURE_DIMENSIONS) * 64 + reg * 4);
-        println("#define s{}_InvSize (MASSEFFECT_UBO ? float2(MASSEFFECT_SHARED_FLOAT({}), MASSEFFECT_SHARED_FLOAT({})) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + {}))",
+        println("#define s{}_InvSize (MASSEFFECT_UBO ? float2(MASSEFFECT_SHARED_FLOAT({}), MASSEFFECT_SHARED_FLOAT({})) : SDNX_RAW_LOAD<float2>(g_PushConstants.SharedConstants + {}))",
             reg, 360 + reg * 8, 364 + reg * 8, 360 + reg * 8);
         println("#endif");
     }

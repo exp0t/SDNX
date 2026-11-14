@@ -10,6 +10,8 @@
  */
 #include <rex/graphics/sdnx/native_command_processor.h>
 
+#include "vulkan_backend.h"
+
 #include <algorithm>
 #include <cstring>
 

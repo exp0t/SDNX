@@ -36,6 +36,23 @@
 
 #ifdef __spirv__
 
+#ifdef SDNX_DEKO3D
+// SDNX deko3d (uam, Mesa's GLSL 4.60 front end): no push constants, no buffer references, no 64-bit integers and
+// no bindless heaps. Constants come only through the UBOs (MASSEFFECT_UBO is true), so the raw-load branches are
+// dead; this stand-in keeps them compiling with 32-bit addresses. Each Xenos texture slot S is its own texture
+// (g_dkT2D_S, g_dkT3D_S, g_dkTCube_S) and sampler (g_dkS_S); the texture bindings are given after SPIRV-Cross.
+struct PushConstants
+{
+    uint VertexShaderConstants;
+    uint PixelShaderConstants;
+    uint SharedConstants;
+};
+
+static PushConstants g_PushConstants;
+template<typename T> T sdnxNoLoad(uint address) { return (T)0; }
+template<typename T> T sdnxNoLoad(uint address, uint alignment) { return (T)0; }
+#define SDNX_RAW_LOAD sdnxNoLoad
+#else
 struct PushConstants
 {
     uint64_t VertexShaderConstants;
@@ -44,6 +61,8 @@ struct PushConstants
 };
 
 [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
+#define SDNX_RAW_LOAD vk::RawBufferLoad
+#endif
 
 // MASSEFFECT: the same blocks of the upload buffer, also as dynamic UBOs in set 4. With
 // -fvk-use-dx-layout each float4 takes 16 contiguous bytes, so any 4-byte word of the shared block is
@@ -60,29 +79,33 @@ struct MassEffectSharedBlock { float4 v[31]; };
 [[vk::binding(0, 4)]] ConstantBuffer<MassEffectBlockVs> g_UboVertex;
 [[vk::binding(1, 4)]] ConstantBuffer<MassEffectBlockPs> g_UboPixel;
 [[vk::binding(2, 4)]] ConstantBuffer<MassEffectSharedBlock> g_UboShared;
+#ifdef SDNX_DEKO3D
+#define MASSEFFECT_UBO true
+#else
 #define MASSEFFECT_UBO ((g_SpecConstants & SPEC_CONSTANT_CONSTANTS_UBO) != 0)
+#endif
 #define MASSEFFECT_SHARED_UINT(B)  asuint(g_UboShared.v[(B) / 16][((B) % 16) / 4])
 #define MASSEFFECT_SHARED_FLOAT(B) g_UboShared.v[(B) / 16][((B) % 16) / 4]
 
-#define g_Booleans                 (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT(256) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256))
-#define g_SwappedTexcoords         (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT(260) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260))
-#define g_HalfPixelOffset          (MASSEFFECT_UBO ? float2(MASSEFFECT_SHARED_FLOAT(264), MASSEFFECT_SHARED_FLOAT(268)) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264))
-#define g_AlphaThreshold           (MASSEFFECT_UBO ? MASSEFFECT_SHARED_FLOAT(272) : vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272))
+#define g_Booleans                 (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT(256) : SDNX_RAW_LOAD<uint>(g_PushConstants.SharedConstants + 256))
+#define g_SwappedTexcoords         (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT(260) : SDNX_RAW_LOAD<uint>(g_PushConstants.SharedConstants + 260))
+#define g_HalfPixelOffset          (MASSEFFECT_UBO ? float2(MASSEFFECT_SHARED_FLOAT(264), MASSEFFECT_SHARED_FLOAT(268)) : SDNX_RAW_LOAD<float2>(g_PushConstants.SharedConstants + 264))
+#define g_AlphaThreshold           (MASSEFFECT_UBO ? MASSEFFECT_SHARED_FLOAT(272) : SDNX_RAW_LOAD<float>(g_PushConstants.SharedConstants + 272))
 // MASSEFFECT: alpha test function (RB_COLORCONTROL.alpha_func): 0 never, 1 <, 2 ==, 3 <=,
 // 4 >, 5 !=, 6 >=, 7 always.
-#define g_AlphaFunction            (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT(276) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276))
+#define g_AlphaFunction            (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT(276) : SDNX_RAW_LOAD<uint>(g_PushConstants.SharedConstants + 276))
 // MASSEFFECT: position to host clip space, like ndc_scale/ndc_offset in the
 // emulation (graphics/util/draw.cpp). (1, 1) and (0, 0) for normal draws;
 // with Xenos clipping disabled it converts from pixels to NDC.
-#define g_NdcScale                 (MASSEFFECT_UBO ? float2(MASSEFFECT_SHARED_FLOAT(280), MASSEFFECT_SHARED_FLOAT(284)) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 280))
-#define g_NdcOffset                (MASSEFFECT_UBO ? float2(MASSEFFECT_SHARED_FLOAT(288), MASSEFFECT_SHARED_FLOAT(292)) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 288))
+#define g_NdcScale                 (MASSEFFECT_UBO ? float2(MASSEFFECT_SHARED_FLOAT(280), MASSEFFECT_SHARED_FLOAT(284)) : SDNX_RAW_LOAD<float2>(g_PushConstants.SharedConstants + 280))
+#define g_NdcOffset                (MASSEFFECT_UBO ? float2(MASSEFFECT_SHARED_FLOAT(288), MASSEFFECT_SHARED_FLOAT(292)) : SDNX_RAW_LOAD<float2>(g_PushConstants.SharedConstants + 288))
 // MASSEFFECT: where each component of the vertex input at that location comes from
 // (D3D patches the fetch swizzle according to the declaration). 0xFFF = as is.
-#define g_InputRemap(LOC)          (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT(296 + (LOC) * 4) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 296 + (LOC) * 4))
+#define g_InputRemap(LOC)          (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT(296 + (LOC) * 4) : SDNX_RAW_LOAD<uint>(g_PushConstants.SharedConstants + 296 + (LOC) * 4))
 // SDNX: the 12-bit destination swizzle Direct3D wrote into vertex fetch number K of the loaded vertex
 // shader (K = order of first emission, listed by the "SDNX_FETCH_ORDER" comment at the end of the HLSL),
 // two per word: bits 0-11 even K, bits 16-27 odd K, at byte 624 + (K / 2) * 4 of the shared constants.
-#define g_FetchSwizzle(K)          (((MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT(624 + ((K) / 2) * 4) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 624 + ((K) / 2) * 4)) >> (((K) & 1) * 16)) & 0xFFF)
+#define g_FetchSwizzle(K)          (((MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT(624 + ((K) / 2) * 4) : SDNX_RAW_LOAD<uint>(g_PushConstants.SharedConstants + 624 + ((K) / 2) * 4)) >> (((K) & 1) * 16)) & 0xFFF)
 
 #ifdef SDNX_FETCH_SWIZZLE
 // SDNX: vertex shaders that compute the index of their vertex fetches (hand-made instancing: the index is read
@@ -178,9 +201,17 @@ float4 sdnxPullFetch(uint k, float indexValue, uint rounded)
 }
 #endif
 
+#ifdef SDNX_DEKO3D
+// SDNX deko3d: one DKSH per shader. The alpha test and its function, which Vulkan specializes, are read from the
+// shared constants (byte 616, a free word between _InvSize and g_FetchSwizzle: the renderer writes the pipeline's
+// specialization value there); the other bits are the values the renderer always uses (CONSTANTS_UBO only).
+#define SDNX_DK_SPEC_OFFSET 616
+#define g_SpecConstants() (SPEC_CONSTANT_CONSTANTS_UBO | (MASSEFFECT_SHARED_UINT(SDNX_DK_SPEC_OFFSET) & (SPEC_CONSTANT_ALPHA_TEST | SPEC_CONSTANT_ALPHA_FUNC_MASK)))
+#else
 [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
 
 #define g_SpecConstants() g_SpecConstants
+#endif
 
 #else
 
@@ -200,10 +231,53 @@ uint g_SpecConstants();
 
 #endif
 
+// SDNX: the translator writes every texture fetch as SDNX_TEX(function, slot, descriptor index, sampler index, ...):
+// the bindless call on Vulkan, the slot's own texture and sampler on deko3d (the index still carries the signs).
+#ifdef SDNX_DEKO3D
+Texture2D<float4> g_dkT2D_0 : register(t0, space0); Texture3D<float4> g_dkT3D_0 : register(t0, space1); TextureCube<float4> g_dkTCube_0 : register(t0, space2); SamplerState g_dkS_0 : register(s0, space3);
+Texture2D<float4> g_dkT2D_1 : register(t1, space0); Texture3D<float4> g_dkT3D_1 : register(t1, space1); TextureCube<float4> g_dkTCube_1 : register(t1, space2); SamplerState g_dkS_1 : register(s1, space3);
+Texture2D<float4> g_dkT2D_2 : register(t2, space0); Texture3D<float4> g_dkT3D_2 : register(t2, space1); TextureCube<float4> g_dkTCube_2 : register(t2, space2); SamplerState g_dkS_2 : register(s2, space3);
+Texture2D<float4> g_dkT2D_3 : register(t3, space0); Texture3D<float4> g_dkT3D_3 : register(t3, space1); TextureCube<float4> g_dkTCube_3 : register(t3, space2); SamplerState g_dkS_3 : register(s3, space3);
+Texture2D<float4> g_dkT2D_4 : register(t4, space0); Texture3D<float4> g_dkT3D_4 : register(t4, space1); TextureCube<float4> g_dkTCube_4 : register(t4, space2); SamplerState g_dkS_4 : register(s4, space3);
+Texture2D<float4> g_dkT2D_5 : register(t5, space0); Texture3D<float4> g_dkT3D_5 : register(t5, space1); TextureCube<float4> g_dkTCube_5 : register(t5, space2); SamplerState g_dkS_5 : register(s5, space3);
+Texture2D<float4> g_dkT2D_6 : register(t6, space0); Texture3D<float4> g_dkT3D_6 : register(t6, space1); TextureCube<float4> g_dkTCube_6 : register(t6, space2); SamplerState g_dkS_6 : register(s6, space3);
+Texture2D<float4> g_dkT2D_7 : register(t7, space0); Texture3D<float4> g_dkT3D_7 : register(t7, space1); TextureCube<float4> g_dkTCube_7 : register(t7, space2); SamplerState g_dkS_7 : register(s7, space3);
+Texture2D<float4> g_dkT2D_8 : register(t8, space0); Texture3D<float4> g_dkT3D_8 : register(t8, space1); TextureCube<float4> g_dkTCube_8 : register(t8, space2); SamplerState g_dkS_8 : register(s8, space3);
+Texture2D<float4> g_dkT2D_9 : register(t9, space0); Texture3D<float4> g_dkT3D_9 : register(t9, space1); TextureCube<float4> g_dkTCube_9 : register(t9, space2); SamplerState g_dkS_9 : register(s9, space3);
+Texture2D<float4> g_dkT2D_10 : register(t10, space0); Texture3D<float4> g_dkT3D_10 : register(t10, space1); TextureCube<float4> g_dkTCube_10 : register(t10, space2); SamplerState g_dkS_10 : register(s10, space3);
+Texture2D<float4> g_dkT2D_11 : register(t11, space0); Texture3D<float4> g_dkT3D_11 : register(t11, space1); TextureCube<float4> g_dkTCube_11 : register(t11, space2); SamplerState g_dkS_11 : register(s11, space3);
+Texture2D<float4> g_dkT2D_12 : register(t12, space0); Texture3D<float4> g_dkT3D_12 : register(t12, space1); TextureCube<float4> g_dkTCube_12 : register(t12, space2); SamplerState g_dkS_12 : register(s12, space3);
+Texture2D<float4> g_dkT2D_13 : register(t13, space0); Texture3D<float4> g_dkT3D_13 : register(t13, space1); TextureCube<float4> g_dkTCube_13 : register(t13, space2); SamplerState g_dkS_13 : register(s13, space3);
+Texture2D<float4> g_dkT2D_14 : register(t14, space0); Texture3D<float4> g_dkT3D_14 : register(t14, space1); TextureCube<float4> g_dkTCube_14 : register(t14, space2); SamplerState g_dkS_14 : register(s14, space3);
+Texture2D<float4> g_dkT2D_15 : register(t15, space0); Texture3D<float4> g_dkT3D_15 : register(t15, space1); TextureCube<float4> g_dkTCube_15 : register(t15, space2); SamplerState g_dkS_15 : register(s15, space3);
+Texture2D<float4> g_dkT2D_16 : register(t16, space0); Texture3D<float4> g_dkT3D_16 : register(t16, space1); TextureCube<float4> g_dkTCube_16 : register(t16, space2); SamplerState g_dkS_16 : register(s16, space3);
+Texture2D<float4> g_dkT2D_17 : register(t17, space0); Texture3D<float4> g_dkT3D_17 : register(t17, space1); TextureCube<float4> g_dkTCube_17 : register(t17, space2); SamplerState g_dkS_17 : register(s17, space3);
+Texture2D<float4> g_dkT2D_18 : register(t18, space0); Texture3D<float4> g_dkT3D_18 : register(t18, space1); TextureCube<float4> g_dkTCube_18 : register(t18, space2); SamplerState g_dkS_18 : register(s18, space3);
+Texture2D<float4> g_dkT2D_19 : register(t19, space0); Texture3D<float4> g_dkT3D_19 : register(t19, space1); TextureCube<float4> g_dkTCube_19 : register(t19, space2); SamplerState g_dkS_19 : register(s19, space3);
+Texture2D<float4> g_dkT2D_20 : register(t20, space0); Texture3D<float4> g_dkT3D_20 : register(t20, space1); TextureCube<float4> g_dkTCube_20 : register(t20, space2); SamplerState g_dkS_20 : register(s20, space3);
+Texture2D<float4> g_dkT2D_21 : register(t21, space0); Texture3D<float4> g_dkT3D_21 : register(t21, space1); TextureCube<float4> g_dkTCube_21 : register(t21, space2); SamplerState g_dkS_21 : register(s21, space3);
+Texture2D<float4> g_dkT2D_22 : register(t22, space0); Texture3D<float4> g_dkT3D_22 : register(t22, space1); TextureCube<float4> g_dkTCube_22 : register(t22, space2); SamplerState g_dkS_22 : register(s22, space3);
+Texture2D<float4> g_dkT2D_23 : register(t23, space0); Texture3D<float4> g_dkT3D_23 : register(t23, space1); TextureCube<float4> g_dkTCube_23 : register(t23, space2); SamplerState g_dkS_23 : register(s23, space3);
+Texture2D<float4> g_dkT2D_24 : register(t24, space0); Texture3D<float4> g_dkT3D_24 : register(t24, space1); TextureCube<float4> g_dkTCube_24 : register(t24, space2); SamplerState g_dkS_24 : register(s24, space3);
+Texture2D<float4> g_dkT2D_25 : register(t25, space0); Texture3D<float4> g_dkT3D_25 : register(t25, space1); TextureCube<float4> g_dkTCube_25 : register(t25, space2); SamplerState g_dkS_25 : register(s25, space3);
+Texture2D<float4> g_dkT2D_26 : register(t26, space0); Texture3D<float4> g_dkT3D_26 : register(t26, space1); TextureCube<float4> g_dkTCube_26 : register(t26, space2); SamplerState g_dkS_26 : register(s26, space3);
+Texture2D<float4> g_dkT2D_27 : register(t27, space0); Texture3D<float4> g_dkT3D_27 : register(t27, space1); TextureCube<float4> g_dkTCube_27 : register(t27, space2); SamplerState g_dkS_27 : register(s27, space3);
+Texture2D<float4> g_dkT2D_28 : register(t28, space0); Texture3D<float4> g_dkT3D_28 : register(t28, space1); TextureCube<float4> g_dkTCube_28 : register(t28, space2); SamplerState g_dkS_28 : register(s28, space3);
+Texture2D<float4> g_dkT2D_29 : register(t29, space0); Texture3D<float4> g_dkT3D_29 : register(t29, space1); TextureCube<float4> g_dkTCube_29 : register(t29, space2); SamplerState g_dkS_29 : register(s29, space3);
+Texture2D<float4> g_dkT2D_30 : register(t30, space0); Texture3D<float4> g_dkT3D_30 : register(t30, space1); TextureCube<float4> g_dkTCube_30 : register(t30, space2); SamplerState g_dkS_30 : register(s30, space3);
+Texture2D<float4> g_dkT2D_31 : register(t31, space0); Texture3D<float4> g_dkT3D_31 : register(t31, space1); TextureCube<float4> g_dkTCube_31 : register(t31, space2); SamplerState g_dkS_31 : register(s31, space3);
+#define SDNX_TEX(FN, SLOT, INDEX, SAMPLER, ...) dk_##FN(SDNX_DK_TEXTURE_##FN(SLOT), g_dkS_##SLOT, INDEX, __VA_ARGS__)
+#define SDNX_DK_TEXTURE_tfetch2D(SLOT) g_dkT2D_##SLOT
+#define SDNX_DK_TEXTURE_getWeights2D(SLOT) g_dkT2D_##SLOT
+#define SDNX_DK_TEXTURE_tfetch3D(SLOT) g_dkT3D_##SLOT
+#define SDNX_DK_TEXTURE_tfetchCube(SLOT) g_dkTCube_##SLOT
+#else
 Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
 Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
 TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
 SamplerState g_SamplerDescriptorHeap[] : register(s0, space3);
+#define SDNX_TEX(FN, SLOT, INDEX, SAMPLER, ...) FN(INDEX, SAMPLER, __VA_ARGS__)
+#endif
 
 uint2 getTexture2DDimensions(Texture2D<float4> texture)
 {
@@ -248,6 +322,7 @@ float4 masseffectApplyTextureSigns(float4 value, uint packedSigns)
     return value;
 }
 
+#ifndef SDNX_DEKO3D
 float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float2 invSize)
 {
     uint packedSigns = resourceDescriptorIndex >> 24;
@@ -271,13 +346,36 @@ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float
         texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + displacement), packedSigns);
 #endif
 }
+#else
+float4 dk_tfetch2D(Texture2D<float4> texture, SamplerState samplerState, uint resourceDescriptorIndex, float2 texCoord, float2 offset, float2 invSize)
+{
+    uint packedSigns = resourceDescriptorIndex >> 24;
+    float2 displacement;
+    [branch] if (g_SpecConstants() & SPEC_CONSTANT_INV_TEX_SIZE)
+        displacement = offset * invSize;
+    else
+        displacement = offset / getTexture2DDimensions(texture);
+#if defined(__SHADER_TARGET_STAGE) && __SHADER_TARGET_STAGE == __SHADER_STAGE_VERTEX
+    return masseffectApplyTextureSigns(texture.SampleLevel(samplerState, texCoord + displacement, 0.0), packedSigns);
+#else
+    return masseffectApplyTextureSigns(texture.Sample(samplerState, texCoord + displacement), packedSigns);
+#endif
+}
+#endif
 
+#ifndef SDNX_DEKO3D
 float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
 {
     resourceDescriptorIndex &= 0x00FFFFFF;
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
     return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset - 0.5));
 }
+#else
+float2 dk_getWeights2D(Texture2D<float4> texture, SamplerState samplerState, uint resourceDescriptorIndex, float2 texCoord, float2 offset)
+{
+    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset - 0.5));
+}
+#endif
 
 float w0(float a)
 {
@@ -319,6 +417,7 @@ float h1(float a)
     return 1.0f + w3(a) / (w2(a) + w3(a)) + 0.5f;
 }
 
+#ifndef SDNX_DEKO3D
 float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
 {
     uint packedSigns = resourceDescriptorIndex >> 24;
@@ -352,7 +451,9 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
 
     return masseffectApplyTextureSigns(r, packedSigns);
 }
+#endif
 
+#ifndef SDNX_DEKO3D
 float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
 {
     uint packedSigns = resourceDescriptorIndex >> 24;
@@ -361,6 +462,12 @@ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float
         g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord),
         packedSigns);
 }
+#else
+float4 dk_tfetch3D(Texture3D<float4> texture, SamplerState samplerState, uint resourceDescriptorIndex, float3 texCoord)
+{
+    return masseffectApplyTextureSigns(texture.Sample(samplerState, texCoord), resourceDescriptorIndex >> 24);
+}
+#endif
 
 struct CubeMapData
 {
@@ -368,6 +475,7 @@ struct CubeMapData
     uint cubeMapIndex;
 };
 
+#ifndef SDNX_DEKO3D
 float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
 {
     uint packedSigns = resourceDescriptorIndex >> 24;
@@ -376,6 +484,13 @@ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, flo
         g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]),
         packedSigns);
 }
+#else
+float4 dk_tfetchCube(TextureCube<float4> texture, SamplerState samplerState, uint resourceDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
+{
+    return masseffectApplyTextureSigns(texture.Sample(samplerState, cubeMapData.cubeMapDirections[texCoord.z]),
+        resourceDescriptorIndex >> 24);
+}
+#endif
 
 float4 tfetchR11G11B10(uint4 value)
 {
@@ -395,7 +510,11 @@ float4 tfetchR11G11B10(uint4 value)
 
 float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
 {
+#ifdef SDNX_DEKO3D
+    return (swappedTexcoords & (1u << semanticIndex)) != 0 ? value.yxwz : value;
+#else
     return (swappedTexcoords & (1ull << semanticIndex)) != 0 ? value.yxwz : value;
+#endif
 }
 
 // SDNX: a vertex fetch with a run-time destination swizzle (Xenos FetchDestinationSwizzle, 3 bits per
@@ -478,11 +597,13 @@ float4 max4(float4 src0)
     return max(max(src0.x, src0.y), max(src0.z, src0.w));
 }
 
+#ifndef SDNX_DEKO3D
 float2 getPixelCoord(uint resourceDescriptorIndex, float2 texCoord)
 {
     resourceDescriptorIndex &= 0x00FFFFFF;
     return getTexture2DDimensions(g_Texture2DDescriptorHeap[resourceDescriptorIndex]) * texCoord;
 }
+#endif
 
 float computeMipLevel(float2 pixelCoord)
 {

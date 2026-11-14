@@ -26,12 +26,13 @@ def after(pattern, text):
     s = s[:line_end + 1] + '\t' + text + '\n' + s[line_end + 1:]
 
 
-after(r'r8\.xyz = tfetch2D\(_texDiffuse_Texture2D', 'float3 dDiffuse = r8.xyz;')
-after(r'r7\.w = tfetch2D\(_texCollector_Texture2D', 'float4 dCollector = tfetch2D(_texCollector_Texture2DDescriptorIndex, _texCollector_SamplerDescriptorIndex, r4.xy, float2(0, 0), _texCollector_InvSize);')
-after(r'r10\.xyzw = tfetch2D\(_texAmbient2_Texture2D', 'float4 dAmbient2 = r10;')
-after(r'r11\.xyz = tfetch2D\(_texDiffuse2_Texture2D', 'float3 dDiffuse2 = r11.xyz;')
-after(r'r5\.xyz = tfetch2D\(_texAmbient_Texture2D', 'float3 dAmbient = r5.xyz;')
-after(r'r1\.xyzw = tfetch3D\(_texFogCube', 'float4 dFog = r1;')
+# The translator writes fetches as SDNX_TEX(tfetch2D, <slot>, ...) since the deko3d mode (older HLSL: tfetch2D(...)).
+after(r'r8\.xyz = (?:SDNX_TEX\(tfetch2D, \d+, |tfetch2D\()_texDiffuse_Texture2D', 'float3 dDiffuse = r8.xyz;')
+after(r'r7\.w = (?:SDNX_TEX\(tfetch2D, \d+, |tfetch2D\()_texCollector_Texture2D', 'float4 dCollector = tfetch2D(_texCollector_Texture2DDescriptorIndex, _texCollector_SamplerDescriptorIndex, r4.xy, float2(0, 0), _texCollector_InvSize);')
+after(r'r10\.xyzw = (?:SDNX_TEX\(tfetch2D, \d+, |tfetch2D\()_texAmbient2_Texture2D', 'float4 dAmbient2 = r10;')
+after(r'r11\.xyz = (?:SDNX_TEX\(tfetch2D, \d+, |tfetch2D\()_texDiffuse2_Texture2D', 'float3 dDiffuse2 = r11.xyz;')
+after(r'r5\.xyz = (?:SDNX_TEX\(tfetch2D, \d+, |tfetch2D\()_texAmbient_Texture2D', 'float3 dAmbient = r5.xyz;')
+after(r'r1\.xyzw = (?:SDNX_TEX\(tfetch3D, \d+, |tfetch3D\()_texFogCube', 'float4 dFog = r1;')
 after(r'r0\.xyz = r4\.xyz \* r0\.www \+ r2\.xyz;', 'float3 dLit = r4.xyz;')
 after(r'r1\.xyz = r4\.xyz \* r0\.www \+ r1\.xyz;', 'float3 dColour = r1.xyz;')
 after(r'r12\.x = r8\.w \* r2\.w;', 'float dAmbDecode = r12.x;')
